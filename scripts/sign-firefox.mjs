@@ -59,7 +59,9 @@ async function main() {
     return;
   }
 
-  const webExtBin = require.resolve('web-ext/bin/web-ext.js');
+  // web-ext 10.x 的 package.json exports 未暴露 ./bin/web-ext.js 子路径，
+  // require.resolve 会抛 ERR_PACKAGE_PATH_NOT_EXPORTED；直接定位本地安装路径。
+  const webExtBin = path.join(rootDir, 'node_modules', 'web-ext', 'bin', 'web-ext.js');
   console.log(`Signing ${sourceDir} (unlisted channel)…`);
 
   const child = spawn(process.execPath, [
