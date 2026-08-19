@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+
 import {
   buildSaveMenuFolderHints,
   type ExtensionFolderOption,
@@ -64,18 +66,11 @@ interface SaveResponse {
 }
 
 function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message ?? 'runtime message failed'));
-        return;
-      }
-      if (response === undefined || response === null) {
-        reject(new Error('runtime message returned empty response'));
-        return;
-      }
-      resolve(response as T);
-    });
+  return browser.runtime.sendMessage(message).then((response) => {
+    if (response === undefined || response === null) {
+      throw new Error('runtime message returned empty response');
+    }
+    return response as T;
   });
 }
 

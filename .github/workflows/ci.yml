@@ -29,5 +29,8 @@ jobs:
       - name: Static verification
         run: npm run lint && npm run typecheck
 
-      - name: Build extension
+      - name: Build extension (Chromium + Firefox)
         run: npm run extension:build
+
+      - name: Lint Firefox build (web-ext)
+        run: npm run extension:lint:firefox

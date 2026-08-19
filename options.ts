@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+
 import {
   DRAG_RADIAL_MENU_ENABLED_KEY,
   dragRadialMenuEnabledFromStored,
@@ -37,38 +39,33 @@ function setStatus(message: string, kind?: 'success' | 'error'): void {
   }
 }
 
-function loadPreferences(): void {
-  chrome.storage.sync.get(
-    [
-      NOTIFICATIONS_ENABLED_KEY,
-      FOCUS_APP_AFTER_SAVE_KEY,
-      REVEAL_IN_LIBRARY_AFTER_SAVE_KEY,
-      DRAG_RADIAL_MENU_ENABLED_KEY,
-    ],
-    (values) => {
-      void chrome.runtime.lastError;
-      if (notificationsCheckbox) {
-        notificationsCheckbox.checked = notificationsEnabledFromStored(
-          values[NOTIFICATIONS_ENABLED_KEY],
-        );
-      }
-      if (focusAppCheckbox) {
-        focusAppCheckbox.checked = focusAppAfterSaveFromStored(
-          values[FOCUS_APP_AFTER_SAVE_KEY],
-        );
-      }
-      if (revealInLibraryCheckbox) {
-        revealInLibraryCheckbox.checked = revealInLibraryAfterSaveFromStored(
-          values[REVEAL_IN_LIBRARY_AFTER_SAVE_KEY],
-        );
-      }
-      if (dragRadialMenuCheckbox) {
-        dragRadialMenuCheckbox.checked = dragRadialMenuEnabledFromStored(
-          values[DRAG_RADIAL_MENU_ENABLED_KEY],
-        );
-      }
-    },
-  );
+async function loadPreferences(): Promise<void> {
+  const values = await browser.storage.sync.get([
+    NOTIFICATIONS_ENABLED_KEY,
+    FOCUS_APP_AFTER_SAVE_KEY,
+    REVEAL_IN_LIBRARY_AFTER_SAVE_KEY,
+    DRAG_RADIAL_MENU_ENABLED_KEY,
+  ]);
+  if (notificationsCheckbox) {
+    notificationsCheckbox.checked = notificationsEnabledFromStored(
+      values[NOTIFICATIONS_ENABLED_KEY],
+    );
+  }
+  if (focusAppCheckbox) {
+    focusAppCheckbox.checked = focusAppAfterSaveFromStored(
+      values[FOCUS_APP_AFTER_SAVE_KEY],
+    );
+  }
+  if (revealInLibraryCheckbox) {
+    revealInLibraryCheckbox.checked = revealInLibraryAfterSaveFromStored(
+      values[REVEAL_IN_LIBRARY_AFTER_SAVE_KEY],
+    );
+  }
+  if (dragRadialMenuCheckbox) {
+    dragRadialMenuCheckbox.checked = dragRadialMenuEnabledFromStored(
+      values[DRAG_RADIAL_MENU_ENABLED_KEY],
+    );
+  }
 }
 
 function bindToggle(

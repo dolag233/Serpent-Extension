@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+
 export const NOTIFICATIONS_ENABLED_KEY = 'serpentNotificationsEnabled';
 export const FOCUS_APP_AFTER_SAVE_KEY = 'serpentFocusAppAfterSave';
 export const REVEAL_IN_LIBRARY_AFTER_SAVE_KEY = 'serpentRevealInLibraryAfterSave';
@@ -29,30 +31,23 @@ export type ExtensionSaveBehavior = {
   revealInLibraryAfterSave: boolean;
 };
 
-export function readExtensionSaveBehavior(): Promise<ExtensionSaveBehavior> {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(
-      [
-        NOTIFICATIONS_ENABLED_KEY,
-        FOCUS_APP_AFTER_SAVE_KEY,
-        REVEAL_IN_LIBRARY_AFTER_SAVE_KEY,
-      ],
-      (values) => {
-        void chrome.runtime.lastError;
-        resolve({
-          notificationsEnabled: notificationsEnabledFromStored(
-            values[NOTIFICATIONS_ENABLED_KEY],
-          ),
-          focusAppAfterSave: focusAppAfterSaveFromStored(
-            values[FOCUS_APP_AFTER_SAVE_KEY],
-          ),
-          revealInLibraryAfterSave: revealInLibraryAfterSaveFromStored(
-            values[REVEAL_IN_LIBRARY_AFTER_SAVE_KEY],
-          ),
-        });
-      },
-    );
-  });
+export async function readExtensionSaveBehavior(): Promise<ExtensionSaveBehavior> {
+  const values = await browser.storage.sync.get([
+    NOTIFICATIONS_ENABLED_KEY,
+    FOCUS_APP_AFTER_SAVE_KEY,
+    REVEAL_IN_LIBRARY_AFTER_SAVE_KEY,
+  ]);
+  return {
+    notificationsEnabled: notificationsEnabledFromStored(
+      values[NOTIFICATIONS_ENABLED_KEY],
+    ),
+    focusAppAfterSave: focusAppAfterSaveFromStored(
+      values[FOCUS_APP_AFTER_SAVE_KEY],
+    ),
+    revealInLibraryAfterSave: revealInLibraryAfterSaveFromStored(
+      values[REVEAL_IN_LIBRARY_AFTER_SAVE_KEY],
+    ),
+  };
 }
 
 export function readNotificationsEnabled(): Promise<boolean> {
@@ -61,52 +56,23 @@ export function readNotificationsEnabled(): Promise<boolean> {
   );
 }
 
-export function writeNotificationsEnabled(enabled: boolean): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.sync.set({ [NOTIFICATIONS_ENABLED_KEY]: enabled }, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+export async function writeNotificationsEnabled(enabled: boolean): Promise<void> {
+  await browser.storage.sync.set({ [NOTIFICATIONS_ENABLED_KEY]: enabled });
 }
 
-export function writeFocusAppAfterSave(enabled: boolean): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.sync.set({ [FOCUS_APP_AFTER_SAVE_KEY]: enabled }, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+export async function writeFocusAppAfterSave(enabled: boolean): Promise<void> {
+  await browser.storage.sync.set({ [FOCUS_APP_AFTER_SAVE_KEY]: enabled });
 }
 
-export function writeRevealInLibraryAfterSave(enabled: boolean): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.sync.set(
-      { [REVEAL_IN_LIBRARY_AFTER_SAVE_KEY]: enabled },
-      () => {
-        void chrome.runtime.lastError;
-        resolve();
-      },
-    );
-  });
+export async function writeRevealInLibraryAfterSave(enabled: boolean): Promise<void> {
+  await browser.storage.sync.set({ [REVEAL_IN_LIBRARY_AFTER_SAVE_KEY]: enabled });
 }
 
-export function readDragRadialMenuEnabled(): Promise<boolean> {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(DRAG_RADIAL_MENU_ENABLED_KEY, (values) => {
-      void chrome.runtime.lastError;
-      resolve(
-        dragRadialMenuEnabledFromStored(values[DRAG_RADIAL_MENU_ENABLED_KEY]),
-      );
-    });
-  });
+export async function readDragRadialMenuEnabled(): Promise<boolean> {
+  const values = await browser.storage.sync.get(DRAG_RADIAL_MENU_ENABLED_KEY);
+  return dragRadialMenuEnabledFromStored(values[DRAG_RADIAL_MENU_ENABLED_KEY]);
 }
 
-export function writeDragRadialMenuEnabled(enabled: boolean): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.sync.set({ [DRAG_RADIAL_MENU_ENABLED_KEY]: enabled }, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+export async function writeDragRadialMenuEnabled(enabled: boolean): Promise<void> {
+  await browser.storage.sync.set({ [DRAG_RADIAL_MENU_ENABLED_KEY]: enabled });
 }

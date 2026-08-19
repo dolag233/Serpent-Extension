@@ -23,15 +23,22 @@ jobs:
       - name: Install exact dependencies
         run: npm ci --registry=https://registry.npmjs.org
 
-      - name: Build extension
+      - name: Build extension (Chromium + Firefox)
         run: npm run extension:build
 
-      - name: Package zip (manifest.json at zip root for Load unpacked)
+      - name: Lint Firefox build (web-ext)
+        run: npm run extension:lint:firefox
+
+      - name: Package zips (manifest.json at zip root for Load unpacked)
         run: |
           cd dist/extension
           zip -r ../../serpent-extension-${{ github.ref_name }}.zip . -x '*.map'
           cd ../..
           sha256sum serpent-extension-${{ github.ref_name }}.zip > serpent-extension-${{ github.ref_name }}.zip.sha256
+          cd dist/extension-firefox
+          zip -r ../../serpent-extension-firefox-${{ github.ref_name }}.zip . -x '*.map'
+          cd ../..
+          sha256sum serpent-extension-firefox-${{ github.ref_name }}.zip > serpent-extension-firefox-${{ github.ref_name }}.zip.sha256
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -39,4 +46,6 @@ jobs:
           files: |
             serpent-extension-${{ github.ref_name }}.zip
             serpent-extension-${{ github.ref_name }}.zip.sha256
+            serpent-extension-firefox-${{ github.ref_name }}.zip
+            serpent-extension-firefox-${{ github.ref_name }}.zip.sha256
           fail_on_unmatched_files: true

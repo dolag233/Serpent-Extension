@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+
 import {
   buildSaveMenuFolderHints,
   buildSaveMenuTree,
@@ -23,6 +25,14 @@ import {
   type UserNotification,
 } from './save-client';
 
+interface SerpentContextMenuClickData {
+  menuItemId: string | number;
+  mediaType?: 'image' | 'video' | 'audio';
+  pageUrl?: string;
+  srcUrl?: string;
+  tab?: { id?: number };
+}
+
 const MENU_ROOT_ID = 'serpent-save';
 const MENU_ROOT_FOLDER_ID = 'serpent-save-root';
 const MENU_SEPARATOR_ID = 'serpent-save-sep';
@@ -34,26 +44,17 @@ let connectionState: 'connected' | 'disconnected' = 'disconnected';
 let dynamicFolderMenuIds: string[] = [];
 let folderMenuRefreshPromise: Promise<void> | null = null;
 
-function readRecentFolderIds(): Promise<string[]> {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(RECENT_FOLDER_IDS_KEY, (values) => {
-      void chrome.runtime.lastError;
-      const stored = values[RECENT_FOLDER_IDS_KEY];
-      resolve(Array.isArray(stored) ? stored.filter((entry) => typeof entry === 'string') : []);
-    });
-  });
+async function readRecentFolderIds(): Promise<string[]> {
+  const values = await browser.storage.local.get(RECENT_FOLDER_IDS_KEY);
+  const stored = values[RECENT_FOLDER_IDS_KEY];
+  return Array.isArray(stored) ? stored.filter((entry) => typeof entry === 'string') : [];
 }
 
-function writeRecentFolderIds(recentFolderIds: string[]): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.local.set({ [RECENT_FOLDER_IDS_KEY]: recentFolderIds }, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+async function writeRecentFolderIds(recentFolderIds: string[]): Promise<void> {
+  await browser.storage.local.set({ [RECENT_FOLDER_IDS_KEY]: recentFolderIds });
 }
 
-function createMenuItem(properties: {
+async function createMenuItem(properties: {
   id: string;
   title?: string;
   contexts?: Array<'image' | 'video'>;
@@ -61,24 +62,14 @@ function createMenuItem(properties: {
   enabled?: boolean;
   type?: 'normal' | 'separator';
 }): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.contextMenus.create(properties, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+  await browser.contextMenus.create(properties);
 }
 
-function updateMenuItem(
+async function updateMenuItem(
   id: string,
   properties: { title?: string; enabled?: boolean },
 ): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.contextMenus.update(id, properties, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+  await browser.contextMenus.update(id, properties);
 }
 
 /** Root context-menu title reflects connection so disabled state is obvious. */
@@ -88,23 +79,16 @@ function setToolbarIcon(connected: boolean): void {
   for (const size of ICON_SIZES) {
     path[String(size)] = `icons/icon${suffix}-${size}.png`;
   }
-  chrome.action.setIcon({ path }, () => {
-    void chrome.runtime.lastError;
-  });
-  chrome.action.setTitle({
+  void browser.action.setIcon({ path }).catch(() => {});
+  void browser.action.setTitle({
     title: connected
       ? 'Serpent 已连接'
       : 'Serpent 未连接，请启动桌面应用并打开资源库',
-  });
+  }).catch(() => {});
 }
 
-function removeMenuItem(id: string): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.contextMenus.remove(id, () => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+async function removeMenuItem(id: string): Promise<void> {
+  await browser.contextMenus.remove(id);
 }
 
 async function removeDynamicFolderMenus(): Promise<void> {
@@ -136,12 +120,7 @@ async function syncSaveMenuEnabled(connected: boolean): Promise<void> {
 }
 
 async function installMenus(): Promise<void> {
-  await new Promise<void>((resolve) => {
-    chrome.contextMenus.removeAll(() => {
-      void chrome.runtime.lastError;
-      resolve();
-    });
-  });
+  await browser.contextMenus.removeAll();
   await createStaticMenus();
 }
 
@@ -281,7 +260,7 @@ async function probeAndReplyConnectionState(): Promise<'connected' | 'disconnect
 }
 
 function scheduleConnectionChecks(): void {
-  chrome.alarms.create(CONNECTION_ALARM, { periodInMinutes: 0.5 });
+  void browser.alarms.create(CONNECTION_ALARM, { periodInMinutes: 0.5 });
   void refreshConnectionState();
 }
 
@@ -289,7 +268,7 @@ function showNotification(notification: UserNotification): void {
   void readExtensionSaveBehavior().then((behavior) => {
     if (!behavior.notificationsEnabled) return;
     notificationSequence += 1;
-    chrome.notifications.create(
+    void browser.notifications.create(
       `serpent-save-${Date.now()}-${notificationSequence}`,
       {
         type: 'basic',
@@ -297,10 +276,7 @@ function showNotification(notification: UserNotification): void {
         title: notification.title,
         message: notification.message,
       },
-      () => {
-        void chrome.runtime.lastError;
-      },
-    );
+    ).catch(() => {});
   });
 }
 
@@ -340,13 +316,10 @@ function notifySaveFeedback(
     | { state: 'done'; title: string; message: string },
 ): void {
   if (!tab?.id) return;
-  chrome.tabs.sendMessage(
+  void browser.tabs.sendMessage(
     tab.id,
     { type: 'serpent-save-feedback', ...payload },
-    () => {
-      void chrome.runtime.lastError;
-    },
-  );
+  ).catch(() => {});
 }
 
 async function handleContextMenuClick(
@@ -398,128 +371,132 @@ async function handleContextMenuClick(
   });
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+browser.runtime.onInstalled.addListener(() => {
   void installMenus().then(() => scheduleConnectionChecks());
 });
 
-chrome.runtime.onStartup.addListener(() => {
+browser.runtime.onStartup.addListener(() => {
   void installMenus().then(() => scheduleConnectionChecks());
 });
 
-chrome.alarms.onAlarm.addListener((alarm) => {
+browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== CONNECTION_ALARM) return;
   void refreshConnectionState();
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || typeof message !== 'object') return;
+// Promise-returning onMessage listener: webextension-polyfill resolves the
+// promise as the response on both Chromium and Firefox (Firefox's native
+// browser.onMessage supports the same contract).
+browser.runtime.onMessage.addListener(async (message: unknown) => {
+  if (!message || typeof message !== 'object') return undefined;
 
   const type = Reflect.get(message, 'type');
 
   if (type === 'serpent-connection-status') {
-    void probeAndReplyConnectionState()
-      .then((kind) => {
-        sendResponse({ kind });
-      })
-      .catch(() => {
-        sendResponse({
-          kind: connectionState === 'connected' ? 'connected' : 'disconnected',
-        });
-      });
-    return true;
+    try {
+      return { kind: await probeAndReplyConnectionState() };
+    } catch {
+      return {
+        kind: connectionState === 'connected' ? 'connected' : 'disconnected',
+      };
+    }
   }
 
   if (type === 'serpent-list-folders') {
-    void (async () => {
-      const outcome = await fetchSerpentFolders();
-      if (outcome.kind === 'ok') {
-        const recentFolderIds = await readRecentFolderIds();
-        const hints = buildSaveMenuFolderHints(
-          outcome.folders,
-          recentFolderIds,
-          outcome.recentBrowsedFolderIds,
-        );
-        sendResponse({
-          kind: 'ok',
-          folders: sortFoldersForSaveMenu(outcome.folders, hints),
-          recentFolderIds: hints.savedRecentIds,
-          recentBrowsedFolderIds: hints.browsedRecentIds,
-          libraryDisplayName: outcome.libraryDisplayName,
-        });
-        return;
-      }
-      sendResponse({ kind: outcome.kind });
-    })();
-    return true;
+    const outcome = await fetchSerpentFolders();
+    if (outcome.kind === 'ok') {
+      const recentFolderIds = await readRecentFolderIds();
+      const hints = buildSaveMenuFolderHints(
+        outcome.folders,
+        recentFolderIds,
+        outcome.recentBrowsedFolderIds,
+      );
+      return {
+        kind: 'ok',
+        folders: sortFoldersForSaveMenu(outcome.folders, hints),
+        recentFolderIds: hints.savedRecentIds,
+        recentBrowsedFolderIds: hints.browsedRecentIds,
+        libraryDisplayName: outcome.libraryDisplayName,
+      };
+    }
+    return { kind: outcome.kind };
   }
 
   if (type === 'serpent-save-request') {
-    void (async () => {
-      if (connectionState !== 'connected') {
-        const notification = {
-          title: '无法保存到 Serpent',
-          message: '请先启动 Serpent 桌面应用并打开资源库。',
-        };
-        showNotification(notification);
-        sendResponse({ notification });
-        return;
-      }
-
-      const intentValue = Reflect.get(message, 'intent');
-      if (!intentValue || typeof intentValue !== 'object') {
-        sendResponse({
-          notification: {
-            title: '无法保存到 Serpent',
-            message: '保存请求无效。',
-          },
-        });
-        return;
-      }
-
-      const kind = Reflect.get(intentValue, 'kind');
-      const sourcePageUrl = Reflect.get(intentValue, 'sourcePageUrl');
-      const mediaUrl = Reflect.get(intentValue, 'mediaUrl');
-      const targetFolderId = Reflect.get(intentValue, 'targetFolderId');
-      if (
-        (kind !== 'image' && kind !== 'video') ||
-        typeof sourcePageUrl !== 'string' ||
-        typeof mediaUrl !== 'string'
-      ) {
-        sendResponse({
-          notification: {
-            title: '无法保存到 Serpent',
-            message: '这个媒体或页面不是可下载的 HTTP(S) 地址。',
-          },
-        });
-        return;
-      }
-
-      const saveIntent: SaveIntent = {
-        kind,
-        sourcePageUrl,
-        mediaUrl,
-        targetFolderId:
-          targetFolderId === null || typeof targetFolderId === 'string'
-            ? targetFolderId
-            : undefined,
+    if (connectionState !== 'connected') {
+      const notification = {
+        title: '无法保存到 Serpent',
+        message: '请先启动 Serpent 桌面应用并打开资源库。',
       };
-      const notification = await saveIntentAndNotify(saveIntent);
-      sendResponse({ notification });
-    })();
-    return true;
+      showNotification(notification);
+      return { notification };
+    }
+
+    const intentValue = Reflect.get(message, 'intent');
+    if (!intentValue || typeof intentValue !== 'object') {
+      return {
+        notification: {
+          title: '无法保存到 Serpent',
+          message: '保存请求无效。',
+        },
+      };
+    }
+
+    const kind = Reflect.get(intentValue, 'kind');
+    const sourcePageUrl = Reflect.get(intentValue, 'sourcePageUrl');
+    const mediaUrl = Reflect.get(intentValue, 'mediaUrl');
+    const targetFolderId = Reflect.get(intentValue, 'targetFolderId');
+    if (
+      (kind !== 'image' && kind !== 'video') ||
+      typeof sourcePageUrl !== 'string' ||
+      typeof mediaUrl !== 'string'
+    ) {
+      return {
+        notification: {
+          title: '无法保存到 Serpent',
+          message: '这个媒体或页面不是可下载的 HTTP(S) 地址。',
+        },
+      };
+    }
+
+    const saveIntent: SaveIntent = {
+      kind,
+      sourcePageUrl,
+      mediaUrl,
+      targetFolderId:
+        targetFolderId === null || typeof targetFolderId === 'string'
+          ? targetFolderId
+          : undefined,
+    };
+    const notification = await saveIntentAndNotify(saveIntent);
+    return { notification };
   }
+
+  return undefined;
 });
 
-if (chrome.contextMenus.onShown) {
-  chrome.contextMenus.onShown.addListener((info) => {
+if (browser.contextMenus.onShown) {
+  browser.contextMenus.onShown.addListener((info) => {
     if (info.contexts.includes('image') || info.contexts.includes('video')) {
       void refreshConnectionState();
     }
   });
 }
 
-chrome.contextMenus.onClicked.addListener((info) => {
-  void handleContextMenuClick(info);
+browser.contextMenus.onClicked.addListener((info, tab) => {
+  const mediaType =
+    info.mediaType === 'image' || info.mediaType === 'video' || info.mediaType === 'audio'
+      ? info.mediaType
+      : undefined;
+  void handleContextMenuClick({
+    menuItemId: info.menuItemId,
+    mediaType,
+    pageUrl: info.pageUrl,
+    srcUrl: info.srcUrl,
+    // contextMenus 的 tab 是回调第二参数（OnClickData 本身没有 tab）；
+    // 之前手写类型把它放在 info 上导致保存反馈气泡收不到 tab。
+    tab: tab ? { id: tab.id } : undefined,
+  });
 });
 
 void installMenus().then(() => scheduleConnectionChecks());

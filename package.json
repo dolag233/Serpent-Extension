@@ -2,21 +2,27 @@
   "name": "serpent-extension",
   "version": "0.1.0",
   "private": true,
-  "description": "Serpent browser extension (Chromium): save web images/videos to the Serpent desktop app.",
+  "description": "Serpent browser extension (Chromium + Firefox): save web images/videos to the Serpent desktop app.",
   "license": "MIT",
   "scripts": {
     "extension:build": "node scripts/build-extension.mjs",
     "extension:verify": "node scripts/build-extension.mjs",
+    "extension:lint:firefox": "web-ext lint --source-dir dist/extension-firefox",
     "typecheck": "tsc --noEmit",
     "lint": "eslint ."
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@types/webextension-polyfill": "^0.12.5",
     "eslint": "10.7.0",
     "globals": "17.7.0",
     "sharp": "^0.35.3",
     "typescript": "6.0.3",
     "typescript-eslint": "8.63.0",
-    "vite": "8.1.4"
+    "vite": "8.1.4",
+    "web-ext": "^10.6.0"
+  },
+  "dependencies": {
+    "webextension-polyfill": "^0.12.0"
   }
 }

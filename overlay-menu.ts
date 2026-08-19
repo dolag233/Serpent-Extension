@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+
 import { disconnectedMenuHint, saveMenuTitle } from './connection-ui';
 import { folderMenuLabel, type ExtensionFolderOption } from './folder-menu';
 import type { MediaTarget } from './media-target';
@@ -26,14 +28,11 @@ interface SaveResponse {
 }
 
 function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message ?? 'runtime message failed'));
-        return;
-      }
-      resolve(response as T);
-    });
+  return browser.runtime.sendMessage(message).then((response) => {
+    if (response === undefined || response === null) {
+      throw new Error('runtime message returned empty response');
+    }
+    return response as T;
   });
 }
 

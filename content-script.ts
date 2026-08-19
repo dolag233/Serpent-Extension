@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+
 import { resolveMediaTargetAtPoint } from './media-target';
 import {
   DRAG_RADIAL_MENU_ENABLED_KEY,
@@ -8,7 +10,8 @@ import { applyDragGhostThumbnail, startRadialSaveMenu } from './radial-menu';
 import { showSaveToast } from './save-bubble';
 
 // 右键菜单保存（background.ts）通过此消息把「保存中/保存结果」反馈到当前页面。
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+// 同步处理、不回复：background 端 tabs.sendMessage 已用 catch 吞掉无响应错误。
+browser.runtime.onMessage.addListener((message: unknown) => {
   if (!message || typeof message !== 'object') return;
   if (Reflect.get(message, 'type') !== 'serpent-save-feedback') return;
   if (Reflect.get(message, 'state') === 'saving') {
@@ -16,7 +19,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   } else {
     showSaveToast(Reflect.get(message, 'title'), Reflect.get(message, 'message'));
   }
-  sendResponse({ ok: true });
 });
 
 // 右键保存走 Chrome 扩展原生 contextMenus（background.ts），不拦截页面右键，
@@ -28,7 +30,7 @@ let radialMenuEnabled = true;
 void readDragRadialMenuEnabled().then((enabled) => {
   radialMenuEnabled = enabled;
 });
-chrome.storage.onChanged.addListener((changes, areaName) => {
+browser.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'sync') return;
   const change = changes[DRAG_RADIAL_MENU_ENABLED_KEY];
   if (change) {
