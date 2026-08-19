@@ -38,6 +38,20 @@
 
 下载新版本 zip → 解压覆盖 → `about:debugging#/runtime/this-firefox` 中点击「重新载入」。
 
+### Firefox 签名发布（正常安装，重启不失效）
+
+Firefox 只允许安装 Mozilla 签名的扩展；临时加载仅适合开发。签名走 AMO **自己托管（unlisted）**渠道，自动签名、无需人工审核：
+
+```bash
+npm run release:firefox
+# 1. 构建双产物 + web-ext lint
+# 2. 交互式隐匿输入 AMO API issuer / secret（不落盘、不进命令行参数）
+#    → 获取方式：https://addons.mozilla.org/developers/addon/api/key/
+# 3. 自动签名，产物在 dist/firefox-signed/serpent_extension-<版本>-an+fx.xpi
+```
+
+安装：`about:addons` → 齿轮 → 「从文件安装附加组件…」→ 选 xpi。每个版本号只能签名一次，改动后需升级 `manifest.firefox.json` 与 `package.json` 的版本号再签。
+
 ## 使用
 
 1. 启动 Serpent 并打开一个资源库。

@@ -8,6 +8,8 @@
     "extension:build": "node scripts/build-extension.mjs",
     "extension:verify": "node scripts/build-extension.mjs",
     "extension:lint:firefox": "web-ext lint --source-dir dist/extension-firefox",
+    "sign:firefox": "node scripts/sign-firefox.mjs",
+    "release:firefox": "npm run extension:build && npm run extension:lint:firefox && npm run sign:firefox",
     "typecheck": "tsc --noEmit",
     "lint": "eslint ."
   },
