@@ -30,11 +30,11 @@
 
 ### Firefox（临时加载）
 
-> 临时加载的扩展在 Firefox 重启后会失效，仅适合体验。
+> 临时加载的扩展在 Firefox 重启后会失效，仅适合开发/体验。Release 只提供签名版 xpi，临时加载需要本地构建：
 
-1. 下载 `serpent-extension-firefox-<版本>.zip` 并解压（文件夹内需直接包含 `manifest.json`）
+1. `git clone https://github.com/dolag233/Serpent-Extension && cd Serpent-Extension && npm ci && npm run extension:build`
 2. 打开 `about:debugging#/runtime/this-firefox`
-3. 点击「临时载入附加组件」，选择解压文件夹内的 `manifest.json`
+3. 点击「临时载入附加组件」，选择 `dist/extension-firefox/manifest.json`
 
 ### 更新
 
