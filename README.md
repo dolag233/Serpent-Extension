@@ -4,6 +4,8 @@
 
 在 Chrome、Edge 等 Chromium 浏览器与 Firefox 中把网页图片或视频保存到正在运行的 Serpent 桌面应用。媒体由**浏览器侧下载**（携带 Cookie 与页面 Referer）再上传到本机 Serpent，可绕过多数防盗链限制；只要 Serpent 在运行且已打开资源库，扩展即可连接（本机 127.0.0.1）。
 
+> 完整的安装、使用、常见问题与隐私说明见 **[docs/browser-extension.md](docs/browser-extension.md)**（可部署为网站文档页）。
+
 ## 安装（Chromium：Chrome / Edge）
 
 > 扩展尚未上架 Chrome/Edge Web Store，需要手动加载（开发者模式）。安装完成后**不会自动更新**——新版本发布后重新下载 zip 并点扩展卡片上的「刷新」即可。
