@@ -7,41 +7,40 @@
 //
 // Requires AMO API keys: https://addons.mozilla.org/developers/addon/api/key/
 import { spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readdir } from 'node:fs/promises';
+import readline from 'node:readline';
 
-const require = createRequire(import.meta.url);
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sourceDir = path.join(rootDir, 'dist', 'extension-firefox');
 const artifactsDir = path.join(rootDir, 'dist', 'firefox-signed');
 
-/** Hidden terminal prompt (no echo, no dependency). */
+/**
+ * Hidden terminal prompt (no echo, no dependency). Uses readline's muted
+ * trick instead of raw stdin so Windows Ctrl+V / right-click paste works.
+ */
 function promptHidden(promptText) {
-  process.stdout.write(promptText);
   return new Promise((resolve) => {
-    const stdin = process.stdin;
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding('utf8');
-    let value = '';
-    const onData = (char) => {
-      if (char === '\r' || char === '\n') {
-        stdin.removeListener('data', onData);
-        stdin.setRawMode(false);
-        stdin.pause();
-        process.stdout.write('\n');
-        resolve(value);
-      } else if (char === '') {
-        process.exit(130);
-      } else if (char === '' || char === '\b') {
-        value = value.slice(0, -1);
-      } else {
-        value += char;
-      }
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: true,
+    });
+    let muted = false;
+    rl._writeToOutput = (stringToWrite) => {
+      if (!muted) rl.output.write(stringToWrite);
     };
-    stdin.on('data', onData);
+    rl.question(promptText, (answer) => {
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer);
+    });
+    // question() 已同步写完 prompt；此后吞掉输入回显（含粘贴的字符）。
+    // 粘贴在 readline terminal 模式下逐字符进入，muted 后无回显但内容保留。
+    setImmediate(() => {
+      muted = true;
+    });
   });
 }
 
@@ -64,20 +63,19 @@ async function main() {
   const webExtBin = path.join(rootDir, 'node_modules', 'web-ext', 'bin', 'web-ext.js');
   console.log(`Signing ${sourceDir} (unlisted channel)…`);
 
+  // web-ext 10.x 只接受 --api-key/--api-secret（不再读 AMO_JWT_* 环境变量）。
+  // 密钥会短暂出现在子进程参数列表（web-ext 的 API 限制），但不写入任何文件。
   const child = spawn(process.execPath, [
     webExtBin,
     'sign',
     '--source-dir', sourceDir,
     '--artifacts-dir', artifactsDir,
     '--channel=unlisted',
+    '--api-key', issuer.trim(),
+    '--api-secret', secret.trim(),
     '--no-input',
   ], {
     cwd: rootDir,
-    env: {
-      ...process.env,
-      AMO_JWT_ISSUER: issuer.trim(),
-      AMO_JWT_SECRET: secret.trim(),
-    },
     stdio: 'inherit',
   });
 
