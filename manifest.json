@@ -7,7 +7,8 @@
     "contextMenus",
     "notifications",
     "storage",
-    "alarms"
+    "alarms",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "http://127.0.0.1:19876/*",

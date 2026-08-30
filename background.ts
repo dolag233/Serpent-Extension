@@ -14,6 +14,7 @@ import {
   type SaveMenuTreeFolder,
 } from './folder-menu';
 import { saveMenuTitle } from './connection-ui';
+import { installHotlinkRules } from './hotlink-sites';
 import { readExtensionSaveBehavior } from './preferences';
 import {
   fetchSerpentFolders,
@@ -264,6 +265,13 @@ function scheduleConnectionChecks(): void {
   void refreshConnectionState();
 }
 
+/** 启动/安装路径统一入口：先建菜单，再注册防盗链 Referer 规则，最后开始连接检查。 */
+async function bootstrapExtension(): Promise<void> {
+  await installMenus();
+  await installHotlinkRules();
+  scheduleConnectionChecks();
+}
+
 function showNotification(notification: UserNotification): void {
   void readExtensionSaveBehavior().then((behavior) => {
     if (!behavior.notificationsEnabled) return;
@@ -372,11 +380,11 @@ async function handleContextMenuClick(
 }
 
 browser.runtime.onInstalled.addListener(() => {
-  void installMenus().then(() => scheduleConnectionChecks());
+  void bootstrapExtension();
 });
 
 browser.runtime.onStartup.addListener(() => {
-  void installMenus().then(() => scheduleConnectionChecks());
+  void bootstrapExtension();
 });
 
 browser.alarms.onAlarm.addListener((alarm) => {
@@ -499,4 +507,4 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
   });
 });
 
-void installMenus().then(() => scheduleConnectionChecks());
+void bootstrapExtension();
