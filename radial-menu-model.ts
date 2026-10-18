@@ -166,6 +166,8 @@ export interface TreeMenuContext {
   readonly recentFolders: readonly FolderNode[];
   /** 当前打开的资源库显示名（根级左侧父节点）。 */
   readonly libraryDisplayName: string;
+  /** 合集模式下根级父节点不能单独保存（必须选中合集）。 */
+  readonly rootSaveEnabled?: boolean;
 }
 
 /** @deprecated 兼容旧名 */
@@ -179,6 +181,8 @@ export interface TreeParentInfo {
   readonly backTarget: TreeLevel;
   /** 根级库名父节点不显示 ‹ */
   readonly showBack: boolean;
+  /** 为 false 时松开父节点不保存（合集模式的库根）。 */
+  readonly saveEnabled?: boolean;
 }
 
 const ROOT_FOLDER_PATH = '根目录';
@@ -271,6 +275,7 @@ export function parentInfoForLevel(
   level: TreeLevel,
   context: TreeMenuContext,
 ): TreeParentInfo {
+  const rootSaveEnabled = context.rootSaveEnabled !== false;
   if (level.kind === 'root') {
     return {
       label: context.libraryDisplayName || 'Serpent',
@@ -278,6 +283,7 @@ export function parentInfoForLevel(
       folderId: null,
       backTarget: { kind: 'root' },
       showBack: false,
+      saveEnabled: rootSaveEnabled,
     };
   }
   if (level.kind === 'all') {
@@ -287,6 +293,7 @@ export function parentInfoForLevel(
       folderId: null,
       backTarget: { kind: 'root' },
       showBack: true,
+      saveEnabled: rootSaveEnabled,
     };
   }
   const node = findFolderNode(context.roots, level.path);
@@ -300,6 +307,7 @@ export function parentInfoForLevel(
     folderId: node?.folderId ?? null,
     backTarget,
     showBack: true,
+    saveEnabled: true,
   };
 }
 
@@ -311,6 +319,7 @@ export function armedHint(
   if (!hit || hit.zone === 'none' || hit.zone === 'cancel') return null;
   if (hit.zone === 'back') return '返回上一级';
   if (hit.zone === 'parent' && parent) {
+    if (parent.saveEnabled === false) return '选择一个合集';
     if (parent.folderId === null && parent.path === ROOT_FOLDER_PATH) {
       return `保存到：${parent.label}（根目录）`;
     }

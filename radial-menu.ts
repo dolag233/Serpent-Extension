@@ -48,6 +48,7 @@ interface ConnectionStatusResponse {
 
 interface FolderListResponse {
   kind: 'ok';
+  targetKind?: 'folder' | 'collection';
   folders: ExtensionFolderOption[];
   recentFolderIds?: string[];
   recentBrowsedFolderIds?: string[];
@@ -56,6 +57,7 @@ interface FolderListResponse {
 
 interface FolderListErrorResponse {
   kind: 'rejected' | 'unreachable';
+  targetKind?: 'folder' | 'collection';
 }
 
 interface SaveResponse {
@@ -325,6 +327,7 @@ interface MenuState {
   media: MediaTarget;
   context: TreeMenuContext;
   layout: TreePanelLayout | null;
+  saveTargetKind: 'folder' | 'collection';
 }
 
 let shadowRoot: ShadowRoot | null = null;
@@ -702,12 +705,17 @@ async function requestSave(
   targetFolderId: string | null,
   bubbleX: number,
   bubbleY: number,
+  saveTargetKind: 'folder' | 'collection',
 ): Promise<void> {
+  const collectionMode = saveTargetKind === 'collection';
   const intent: SaveIntent = {
     kind: media.kind,
     sourcePageUrl: window.location.href,
     mediaUrl: media.mediaUrl,
-    targetFolderId,
+    targetFolderId: collectionMode ? null : targetFolderId,
+    ...(collectionMode && targetFolderId
+      ? { targetCollectionId: targetFolderId }
+      : {}),
   };
   const response = await sendRuntimeMessage<SaveResponse>({
     type: 'serpent-save-request',
@@ -839,11 +847,15 @@ function onDrop(event: DragEvent): void {
         `保存到：${item.path.split('/').join(' / ')}`,
         '发送中…',
       );
-      void requestSave(media, item.folderId, event.clientX, event.clientY);
+      void requestSave(media, item.folderId, event.clientX, event.clientY, s.saveTargetKind);
       return;
     }
   }
   if (hit.zone === 'parent' && parent) {
+    if (parent.saveEnabled === false) {
+      closeMenu();
+      return;
+    }
     const media = s.media;
     closeMenu();
     const label =
@@ -851,7 +863,7 @@ function onDrop(event: DragEvent): void {
         ? `${parent.label}（根目录）`
         : parent.path.split('/').join(' / ');
     showSaveBubble(event.clientX, event.clientY, `保存到：${label}`, '发送中…');
-    void requestSave(media, parent.folderId, event.clientX, event.clientY);
+    void requestSave(media, parent.folderId, event.clientX, event.clientY, s.saveTargetKind);
     return;
   }
   // drill/back 上松开不保存；非可展开 › 区松开视为取消
@@ -926,6 +938,7 @@ function openMenu(
     media,
     context,
     layout: null,
+    saveTargetKind: context.rootSaveEnabled === false ? 'collection' : 'folder',
   };
   attachDragListeners();
   renderStatic();
@@ -1023,11 +1036,23 @@ export async function startRadialSaveMenu(
       roots: [],
       recentFolders: [],
       libraryDisplayName: 'Serpent',
+      rootSaveEnabled: true,
     };
     try {
       const response = await sendRuntimeMessage<FolderListResponse | FolderListErrorResponse>({
         type: 'serpent-list-folders',
       });
+      if (response.kind !== 'ok') {
+        if (response.targetKind === 'collection' && !dragEndedEarly) {
+          showSaveBubble(clientX, clientY, '无法读取合集', '请确认 Serpent 已打开资源库');
+        }
+        if (response.targetKind === 'collection') return;
+      } else if (response.targetKind === 'collection' && response.folders.length === 0) {
+        if (!dragEndedEarly) {
+          showSaveBubble(clientX, clientY, '尚无合集', '请先在 Serpent 中创建合集');
+        }
+        return;
+      }
       if (response.kind === 'ok') {
         const tree = buildFolderTree(response.folders);
         const hints = buildSaveMenuFolderHints(
@@ -1050,6 +1075,7 @@ export async function startRadialSaveMenu(
             response.libraryDisplayName.trim()
               ? response.libraryDisplayName.trim()
               : 'Serpent',
+          rootSaveEnabled: response.targetKind !== 'collection',
         };
       }
     } catch {

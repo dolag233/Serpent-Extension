@@ -2,8 +2,23 @@
 body { margin: 0; }
 main { max-width: 620px; margin: 8vh auto; padding: 32px; background: #1a1e21; border: 1px solid #30363a; border-radius: 12px; }
 h1 { margin: 0 0 20px; font-size: 18px; }
+h2 { margin: 0; font-size: 13px; font-weight: 600; color: #e8ebe8; }
 p { color: #aeb5b1; line-height: 1.6; }
 .options-section { display: grid; gap: 14px; }
+.options-section + .options-section { margin-top: 22px; }
+.options-hint { margin: 0; font-size: 12px; }
+body.popup main {
+  margin: 0;
+  width: 320px;
+  max-width: none;
+  padding: 16px;
+  border: 0;
+  border-radius: 0;
+}
+body.popup h1 { margin-bottom: 14px; font-size: 15px; }
+body.popup .options-section { gap: 10px; }
+body.popup .options-section + .options-section { margin-top: 16px; }
+body.popup #status { margin-top: 12px; min-height: 1.2em; }
 .options-toggle { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; color: #d5dad7; cursor: pointer; }
 .options-toggle input { margin-top: 2px; }
 #status { margin-top: 20px; font-size: 12px; }

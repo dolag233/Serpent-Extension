@@ -6,6 +6,7 @@ import {
 
 export const EXTENSION_ROOT_FOLDER_KEY = '__root__';
 export const RECENT_FOLDER_IDS_KEY = 'recentFolderIds';
+export const RECENT_COLLECTION_IDS_KEY = 'recentCollectionIds';
 export const MAX_RECENT_FOLDERS = 20;
 
 export type ExtensionFolderOption = {

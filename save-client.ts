@@ -11,6 +11,15 @@ export interface SaveIntent {
   sourcePageUrl: string;
   mediaUrl: string;
   targetFolderId?: string | null;
+  /** 合集模式：文件仍进资源库根目录，保存成功后再加入该合集。 */
+  targetCollectionId?: string;
+}
+
+export interface ExtensionCollectionOption {
+  readonly collectionId: string;
+  readonly name: string;
+  readonly relativePath: string;
+  readonly assetCount?: number;
 }
 
 export interface ContextMenuMediaInfo {
@@ -34,6 +43,15 @@ export type FolderListOutcome =
       kind: 'ok';
       folders: ExtensionFolderOption[];
       recentBrowsedFolderIds: string[];
+      libraryDisplayName: string;
+    }
+  | { kind: 'rejected'; status: number; reason: string }
+  | { kind: 'unreachable' };
+
+export type CollectionListOutcome =
+  | {
+      kind: 'ok';
+      collections: ExtensionCollectionOption[];
       libraryDisplayName: string;
     }
   | { kind: 'rejected'; status: number; reason: string }
@@ -199,6 +217,74 @@ export async function fetchSerpentFolders(
       kind: 'ok',
       folders: parsed.folders,
       recentBrowsedFolderIds: parsed.recentBrowsedFolderIds,
+      libraryDisplayName: parsed.libraryDisplayName,
+    };
+  }
+
+  return {
+    kind: 'rejected',
+    status: response.status,
+    reason: rejectionReason(body) ?? `HTTP ${response.status}`,
+  };
+}
+
+function parseCollectionList(body: string): {
+  collections: ExtensionCollectionOption[];
+  libraryDisplayName: string;
+} {
+  const parsed = JSON.parse(body) as unknown;
+  if (!parsed || typeof parsed !== 'object') {
+    return { collections: [], libraryDisplayName: 'Serpent' };
+  }
+  const collections = Reflect.get(parsed, 'collections');
+  const libraryDisplayNameValue = Reflect.get(parsed, 'libraryDisplayName');
+  const libraryDisplayName =
+    typeof libraryDisplayNameValue === 'string' && libraryDisplayNameValue.trim()
+      ? libraryDisplayNameValue.trim()
+      : 'Serpent';
+  const collectionList = !Array.isArray(collections) ? [] : collections.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const collectionId = Reflect.get(entry, 'collectionId');
+    const name = Reflect.get(entry, 'name');
+    const relativePath = Reflect.get(entry, 'relativePath');
+    const assetCount = Reflect.get(entry, 'assetCount');
+    if (
+      typeof collectionId !== 'string' ||
+      typeof name !== 'string' ||
+      typeof relativePath !== 'string'
+    ) {
+      return [];
+    }
+    return [{
+      collectionId,
+      name,
+      relativePath,
+      ...(typeof assetCount === 'number' && Number.isFinite(assetCount)
+        ? { assetCount: Math.max(0, Math.floor(assetCount)) }
+        : {}),
+    }];
+  });
+  return { collections: collectionList, libraryDisplayName };
+}
+
+export async function fetchSerpentCollections(
+  fetchFn: FetchFunction = fetch,
+): Promise<CollectionListOutcome> {
+  const response = await requestSerpent('/collections', { method: 'GET' }, fetchFn);
+  if (!response) return { kind: 'unreachable' };
+
+  let body: string;
+  try {
+    body = await response.text();
+  } catch {
+    body = '';
+  }
+
+  if (response.status === 200) {
+    const parsed = parseCollectionList(body);
+    return {
+      kind: 'ok',
+      collections: parsed.collections,
       libraryDisplayName: parsed.libraryDisplayName,
     };
   }
@@ -393,6 +479,9 @@ export async function deliverSaveUpload(
   if (intent.targetFolderId !== undefined) {
     headers['X-Serpent-Target-Folder-Id'] =
       intent.targetFolderId === null ? 'null' : encodeURIComponent(intent.targetFolderId);
+  }
+  if (intent.targetCollectionId) {
+    headers['X-Serpent-Target-Collection-Id'] = encodeURIComponent(intent.targetCollectionId);
   }
 
   const response = await requestSerpent(

@@ -11,6 +11,19 @@
       <h1>Serpent 扩展设置</h1>
 
       <section class="options-section">
+        <h2>保存目标</h2>
+        <label class="options-toggle">
+          <input id="save-target-folder" name="save-target-kind" type="radio" value="folder">
+          <span>保存到文件夹</span>
+        </label>
+        <label class="options-toggle">
+          <input id="save-target-collection" name="save-target-kind" type="radio" value="collection">
+          <span>保存到合集</span>
+        </label>
+        <p class="options-hint">保存到合集时，文件进入资源库根目录，并加入所选合集。右键菜单和拖拽菜单会改为列出合集。</p>
+      </section>
+
+      <section class="options-section">
         <label class="options-toggle">
           <input id="notifications-enabled" type="checkbox">
           <span>保存后显示系统通知</span>

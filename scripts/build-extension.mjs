@@ -85,12 +85,17 @@ async function validateBuild(outDir, target) {
   await assertFile(outDir, 'options.js');
   await assertFile(outDir, 'options.html');
   await assertFile(outDir, 'options.css');
+  await assertFile(outDir, 'popup.js');
+  await assertFile(outDir, 'popup.html');
+  if (manifest.action?.default_popup !== 'popup.html') {
+    throw new Error('Extension action must open popup.html');
+  }
   await assertFile(outDir, 'README.md');
 
   // 三个脚本都必须是自包含单文件。多入口同一次构建会让 Rollup 抽取共享 chunk，
   // 产物首行出现 import 语句；Chrome content script 与 Firefox event page
   // 都不能是 ES module，整个脚本会解析失败、静默失效（2026-07-25 实测事故）。
-  for (const relativePath of ['background.js', 'content-script.js', 'options.js']) {
+  for (const relativePath of ['background.js', 'content-script.js', 'options.js', 'popup.js']) {
     const source = await readFile(path.join(outDir, relativePath), 'utf8');
     if (/^(?:import|export)\s/m.test(source)) {
       throw new Error(
@@ -128,6 +133,7 @@ const scriptEntries = [
   { name: 'background', format: 'es' },
   { name: 'content-script', format: 'iife' },
   { name: 'options', format: 'es' },
+  { name: 'popup', format: 'es' },
 ];
 
 async function bundleScriptEntries(outDir) {
@@ -159,6 +165,7 @@ async function copyStaticAssets(outDir) {
   await copyFile(path.join(sourceDir, 'README.md'), path.join(outDir, 'README.md'));
   await copyFile(path.join(sourceDir, 'options.html'), path.join(outDir, 'options.html'));
   await copyFile(path.join(sourceDir, 'options.css'), path.join(outDir, 'options.css'));
+  await copyFile(path.join(sourceDir, 'popup.html'), path.join(outDir, 'popup.html'));
   await mkdir(path.join(outDir, 'icons'), { recursive: true });
 
   await Promise.all(extensionIconSizes.flatMap((size) => [

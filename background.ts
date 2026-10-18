@@ -8,6 +8,7 @@ import {
   MENU_ROOT_PARENT_ID,
   parseFolderMenuId,
   pushRecentFolderId,
+  RECENT_COLLECTION_IDS_KEY,
   RECENT_FOLDER_IDS_KEY,
   sortFoldersForSaveMenu,
   type ExtensionFolderOption,
@@ -15,13 +16,20 @@ import {
 } from './folder-menu';
 import { saveMenuTitle } from './connection-ui';
 import { installHotlinkRules } from './hotlink-sites';
-import { readExtensionSaveBehavior } from './preferences';
 import {
+  readExtensionSaveBehavior,
+  readSaveTargetKind,
+  SAVE_TARGET_KIND_KEY,
+  type SaveTargetKind,
+} from './preferences';
+import {
+  fetchSerpentCollections,
   fetchSerpentFolders,
   notificationForOutcome,
   probeSerpentConnection,
   saveIntentFromContextMenu,
   saveMediaViaBrowser,
+  type ExtensionCollectionOption,
   type SaveIntent,
   type UserNotification,
 } from './save-client';
@@ -37,6 +45,7 @@ interface SerpentContextMenuClickData {
 const MENU_ROOT_ID = 'serpent-save';
 const MENU_ROOT_FOLDER_ID = 'serpent-save-root';
 const MENU_SEPARATOR_ID = 'serpent-save-sep';
+const MENU_NOTICE_ID = 'serpent-save-notice';
 const CONNECTION_ALARM = 'serpent-connection-check';
 const ICON_SIZES = [32, 48, 64, 128] as const;
 
@@ -53,6 +62,27 @@ async function readRecentFolderIds(): Promise<string[]> {
 
 async function writeRecentFolderIds(recentFolderIds: string[]): Promise<void> {
   await browser.storage.local.set({ [RECENT_FOLDER_IDS_KEY]: recentFolderIds });
+}
+
+async function readRecentCollectionIds(): Promise<string[]> {
+  const values = await browser.storage.local.get(RECENT_COLLECTION_IDS_KEY);
+  const stored = values[RECENT_COLLECTION_IDS_KEY];
+  return Array.isArray(stored) ? stored.filter((entry) => typeof entry === 'string') : [];
+}
+
+async function writeRecentCollectionIds(recentCollectionIds: string[]): Promise<void> {
+  await browser.storage.local.set({ [RECENT_COLLECTION_IDS_KEY]: recentCollectionIds });
+}
+
+function collectionsAsFolderOptions(
+  collections: readonly ExtensionCollectionOption[],
+): ExtensionFolderOption[] {
+  return collections.map((collection) => ({
+    folderId: collection.collectionId,
+    name: collection.name,
+    relativePath: collection.relativePath,
+    ...(collection.assetCount === undefined ? {} : { assetCount: collection.assetCount }),
+  }));
 }
 
 async function createMenuItem(properties: {
@@ -129,6 +159,7 @@ async function installMenus(): Promise<void> {
 async function createFolderSubmenu(
   parentId: string,
   folder: SaveMenuTreeFolder,
+  selfTitle: string,
 ): Promise<void> {
   const id = folderMenuItemId(folder);
   dynamicFolderMenuIds.push(id);
@@ -140,21 +171,65 @@ async function createFolderSubmenu(
     enabled: true,
   });
   if (folder.children.length > 0 && folder.folderId !== null) {
-    // contextMenus 父项点击只展开不保存；子菜单第一行提供「保存到此文件夹」
-    // （对齐拖拽树「松开 = 保存进该文件夹」）。
+    // contextMenus 父项点击只展开不保存；子菜单第一行提供保存到当前节点
+    // （对齐拖拽树「松开 = 保存进该文件夹/合集」）。
     const selfId = folderMenuSelfId(folder.folderId);
     dynamicFolderMenuIds.push(selfId);
     await createMenuItem({
       id: selfId,
       parentId: id,
-      title: '保存到此文件夹',
+      title: selfTitle,
       contexts: ['image', 'video'],
       enabled: true,
     });
   }
   for (const child of folder.children) {
-    await createFolderSubmenu(id, child);
+    await createFolderSubmenu(id, child, selfTitle);
   }
+}
+
+async function createNoticeMenuItem(title: string): Promise<void> {
+  dynamicFolderMenuIds.push(MENU_NOTICE_ID);
+  await createMenuItem({
+    id: MENU_NOTICE_ID,
+    parentId: MENU_ROOT_ID,
+    title,
+    contexts: ['image', 'video'],
+    enabled: false,
+  });
+}
+
+async function listSaveTargets(kind: SaveTargetKind): Promise<
+  | {
+      kind: 'ok';
+      folders: ExtensionFolderOption[];
+      recentIds: string[];
+      browsedIds: string[];
+      libraryDisplayName: string;
+    }
+  | { kind: 'rejected' | 'unreachable' }
+> {
+  if (kind === 'collection') {
+    const outcome = await fetchSerpentCollections();
+    if (outcome.kind !== 'ok') return { kind: outcome.kind };
+    return {
+      kind: 'ok',
+      folders: collectionsAsFolderOptions(outcome.collections),
+      recentIds: await readRecentCollectionIds(),
+      browsedIds: [],
+      libraryDisplayName: outcome.libraryDisplayName,
+    };
+  }
+
+  const outcome = await fetchSerpentFolders();
+  if (outcome.kind !== 'ok') return { kind: outcome.kind };
+  return {
+    kind: 'ok',
+    folders: outcome.folders,
+    recentIds: await readRecentFolderIds(),
+    browsedIds: outcome.recentBrowsedFolderIds,
+    libraryDisplayName: outcome.libraryDisplayName,
+  };
 }
 
 async function refreshFolderMenus(): Promise<void> {
@@ -169,25 +244,35 @@ async function refreshFolderMenus(): Promise<void> {
       return;
     }
 
-    const outcome = await fetchSerpentFolders();
-    if (outcome.kind !== 'ok') {
+    const saveTargetKind = await readSaveTargetKind();
+    const listed = await listSaveTargets(saveTargetKind);
+    if (listed.kind !== 'ok') {
       await removeDynamicFolderMenus();
+      if (saveTargetKind === 'collection') {
+        await createNoticeMenuItem('无法读取合集');
+      }
       return;
     }
 
     await removeDynamicFolderMenus();
 
-    const recentFolderIds = await readRecentFolderIds();
     const hints = buildSaveMenuFolderHints(
-      outcome.folders,
-      recentFolderIds,
-      outcome.recentBrowsedFolderIds,
+      listed.folders,
+      listed.recentIds,
+      listed.browsedIds,
     );
+    const selfTitle = saveTargetKind === 'collection' ? '保存到此合集' : '保存到此文件夹';
+    const tree = buildSaveMenuTree(listed.folders, hints);
+    if (saveTargetKind === 'collection' && tree.length === 0) {
+      await createNoticeMenuItem('尚无合集');
+      return;
+    }
 
-    // 与拖拽树一致：最近保存/浏览 → 分割线 → 根目录 → 所有一级目录（子级递归展开）。
+    // 文件夹模式与拖拽树一致：最近保存/浏览 → 分割线 → 根目录 → 所有一级目录。
+    // 合集模式没有「只保存到根目录」项：选中合集后文件进根目录并加入该合集。
     let rootParentCreated = false;
     const createRootParentMenu = async (): Promise<void> => {
-      if (rootParentCreated) return;
+      if (saveTargetKind !== 'folder' || rootParentCreated) return;
       rootParentCreated = true;
       dynamicFolderMenuIds.push(MENU_ROOT_PARENT_ID);
       await createMenuItem({
@@ -208,7 +293,7 @@ async function refreshFolderMenus(): Promise<void> {
     };
 
     let separatorCreated = false;
-    for (const item of buildSaveMenuTree(outcome.folders, hints)) {
+    for (const item of tree) {
       if (item.kind === 'separator') {
         if (separatorCreated) continue;
         separatorCreated = true;
@@ -219,14 +304,12 @@ async function refreshFolderMenus(): Promise<void> {
           parentId: MENU_ROOT_ID,
           contexts: ['image', 'video'],
         });
-        // 根目录父菜单紧随分割线之后（拖拽树中库名父节点位于列表顶部）
         await createRootParentMenu();
         continue;
       }
-      await createFolderSubmenu(MENU_ROOT_ID, item.folder);
+      await createFolderSubmenu(MENU_ROOT_ID, item.folder, selfTitle);
     }
     if (!rootParentCreated) {
-      // 无分割线（仅最近或仅一级目录）时根目录排在列表末尾
       await createRootParentMenu();
     }
   })().finally(() => {
@@ -299,16 +382,73 @@ async function rememberRecentFolder(
   );
 }
 
+async function resolveSaveIntent(
+  intent: SaveIntent,
+): Promise<SaveIntent | UserNotification> {
+  const kind = await readSaveTargetKind();
+  if (kind === 'folder') {
+    return {
+      kind: intent.kind,
+      sourcePageUrl: intent.sourcePageUrl,
+      mediaUrl: intent.mediaUrl,
+      ...(intent.targetFolderId !== undefined
+        ? { targetFolderId: intent.targetFolderId }
+        : {}),
+    };
+  }
+
+  const collectionId =
+    typeof intent.targetCollectionId === 'string' && intent.targetCollectionId
+      ? intent.targetCollectionId
+      : typeof intent.targetFolderId === 'string' && intent.targetFolderId
+        ? intent.targetFolderId
+        : undefined;
+  if (!collectionId) {
+    return {
+      title: '无法保存到 Serpent',
+      message: '当前为保存到合集，请选择一个合集。',
+    };
+  }
+  return {
+    kind: intent.kind,
+    sourcePageUrl: intent.sourcePageUrl,
+    mediaUrl: intent.mediaUrl,
+    targetFolderId: null,
+    targetCollectionId: collectionId,
+  };
+}
+
 async function saveIntentAndNotify(intent: SaveIntent): Promise<UserNotification> {
+  const resolved = await resolveSaveIntent(intent);
+  if ('title' in resolved) {
+    showNotification(resolved);
+    return resolved;
+  }
+
   const behavior = await readExtensionSaveBehavior();
-  const outcome = await saveMediaViaBrowser(intent, behavior);
+  const outcome = await saveMediaViaBrowser(resolved, behavior);
   if (outcome.kind === 'accepted') {
-    const foldersOutcome = await fetchSerpentFolders();
-    if (foldersOutcome.kind === 'ok') {
-      const folderId =
-        typeof intent.targetFolderId === 'string' ? intent.targetFolderId : null;
-      await rememberRecentFolder(folderId, foldersOutcome.folders);
-      await refreshFolderMenus();
+    if (resolved.targetCollectionId) {
+      const collectionsOutcome = await fetchSerpentCollections();
+      if (collectionsOutcome.kind === 'ok') {
+        const recentCollectionIds = await readRecentCollectionIds();
+        await writeRecentCollectionIds(
+          pushRecentFolderId(
+            recentCollectionIds,
+            resolved.targetCollectionId,
+            new Set(collectionsOutcome.collections.map((collection) => collection.collectionId)),
+          ),
+        );
+        await refreshFolderMenus();
+      }
+    } else {
+      const foldersOutcome = await fetchSerpentFolders();
+      if (foldersOutcome.kind === 'ok') {
+        const folderId =
+          typeof resolved.targetFolderId === 'string' ? resolved.targetFolderId : null;
+        await rememberRecentFolder(folderId, foldersOutcome.folders);
+        await refreshFolderMenus();
+      }
     }
   }
   const notification = notificationForOutcome(outcome);
@@ -392,6 +532,11 @@ browser.alarms.onAlarm.addListener((alarm) => {
   void refreshConnectionState();
 });
 
+browser.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'sync' || !changes[SAVE_TARGET_KIND_KEY]) return;
+  void refreshFolderMenus();
+});
+
 // Promise-returning onMessage listener: webextension-polyfill resolves the
 // promise as the response on both Chromium and Firefox (Firefox's native
 // browser.onMessage supports the same contract).
@@ -411,23 +556,24 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
   }
 
   if (type === 'serpent-list-folders') {
-    const outcome = await fetchSerpentFolders();
+    const saveTargetKind = await readSaveTargetKind();
+    const outcome = await listSaveTargets(saveTargetKind);
     if (outcome.kind === 'ok') {
-      const recentFolderIds = await readRecentFolderIds();
       const hints = buildSaveMenuFolderHints(
         outcome.folders,
-        recentFolderIds,
-        outcome.recentBrowsedFolderIds,
+        outcome.recentIds,
+        outcome.browsedIds,
       );
       return {
         kind: 'ok',
+        targetKind: saveTargetKind,
         folders: sortFoldersForSaveMenu(outcome.folders, hints),
         recentFolderIds: hints.savedRecentIds,
         recentBrowsedFolderIds: hints.browsedRecentIds,
         libraryDisplayName: outcome.libraryDisplayName,
       };
     }
-    return { kind: outcome.kind };
+    return { kind: outcome.kind, targetKind: saveTargetKind };
   }
 
   if (type === 'serpent-save-request') {
@@ -454,6 +600,7 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
     const sourcePageUrl = Reflect.get(intentValue, 'sourcePageUrl');
     const mediaUrl = Reflect.get(intentValue, 'mediaUrl');
     const targetFolderId = Reflect.get(intentValue, 'targetFolderId');
+    const targetCollectionId = Reflect.get(intentValue, 'targetCollectionId');
     if (
       (kind !== 'image' && kind !== 'video') ||
       typeof sourcePageUrl !== 'string' ||
@@ -475,6 +622,9 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
         targetFolderId === null || typeof targetFolderId === 'string'
           ? targetFolderId
           : undefined,
+      ...(typeof targetCollectionId === 'string' && targetCollectionId
+        ? { targetCollectionId }
+        : {}),
     };
     const notification = await saveIntentAndNotify(saveIntent);
     return { notification };
