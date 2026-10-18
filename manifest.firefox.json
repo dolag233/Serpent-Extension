@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Serpent",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Save images and videos from the web to Serpent digital asset manager.",
   "permissions": [
     "contextMenus",
