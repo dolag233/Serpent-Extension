@@ -8,37 +8,73 @@
   </head>
   <body class="popup">
     <main>
-      <h1>Serpent</h1>
+      <header class="bar">
+        <h1>Serpent</h1>
+      </header>
 
-      <section class="options-section">
-        <h2>保存目标</h2>
-        <label class="options-toggle">
-          <input id="save-target-folder" name="save-target-kind" type="radio" value="folder">
-          <span>保存到文件夹</span>
-        </label>
-        <label class="options-toggle">
-          <input id="save-target-collection" name="save-target-kind" type="radio" value="collection">
-          <span>保存到合集</span>
-        </label>
-        <p class="options-hint">保存到合集时，文件进入资源库根目录，并加入所选合集。</p>
+      <section class="block">
+        <h2>采集</h2>
+        <div class="capture-grid">
+          <button id="batch-save" class="capture" type="button" title="批量收藏此页（Alt+1）" aria-label="批量收藏此页">
+            <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
+            <span>批量</span>
+          </button>
+          <button id="capture-visible" class="capture" type="button" title="截取可见区域（Alt+3）" aria-label="截取可见区域">
+            <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/></svg>
+            <span>可见</span>
+          </button>
+          <button id="capture-area" class="capture" type="button" title="截取区域（Alt+2）" aria-label="截取区域">
+            <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5H3.5a1 1 0 0 0-1 1V5M11 2.5h1.5a1 1 0 0 1 1 1V5M5 13.5H3.5a1 1 0 0 1-1-1V11M11 13.5h1.5a1 1 0 0 0 1-1V11"/></svg>
+            <span>区域</span>
+          </button>
+          <button id="capture-element" class="capture" type="button" title="截取元件" aria-label="截取元件">
+            <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="1"/><path d="M9.5 9.5 13 11l-1.4 1 .7 1.6-1.5.6-.7-1.6L9 14z"/></svg>
+            <span>元件</span>
+          </button>
+          <button id="capture-page" class="capture" type="button" title="整页截图（Alt+4）" aria-label="整页截图">
+            <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5h4.2L12 5.2V13.5H5z"/><path d="M9 2.6V5.4h2.8M6.6 8h4M6.6 10.4h2.6"/></svg>
+            <span>整页</span>
+          </button>
+        </div>
+        <p class="hint">Alt+右键保存指针下的图片。截取元件可在扩展快捷键页自行绑定。</p>
       </section>
 
-      <section class="options-section">
-        <label class="options-toggle">
+      <section class="block">
+        <h2>保存目标</h2>
+        <div class="segment" role="radiogroup" aria-label="保存目标">
+          <label class="segment-item" title="保存到文件夹">
+            <input id="save-target-folder" name="save-target-kind" type="radio" value="folder" aria-label="保存到文件夹">
+            <span><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.2 4.2h3.8l1.2 1.4h6.6v6.6H2.2z"/></svg>文件夹</span>
+          </label>
+          <label class="segment-item" title="保存到合集">
+            <input id="save-target-collection" name="save-target-kind" type="radio" value="collection" aria-label="保存到合集">
+            <span><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.4 13.2 5 8 7.6 2.8 5zM3.2 7.4 8 10l4.8-2.6M3.2 10.2 8 12.8l4.8-2.6"/></svg>合集</span>
+          </label>
+        </div>
+        <p class="hint">保存到合集时，文件进入资源库根目录，并加入所选合集。</p>
+      </section>
+
+      <section class="block">
+        <h2>保存之后</h2>
+        <label class="setting-row">
           <input id="notifications-enabled" type="checkbox">
-          <span>保存后显示系统通知</span>
+          <span class="setting-mark"></span>
+          <span>显示系统通知</span>
         </label>
-        <label class="options-toggle">
+        <label class="setting-row">
           <input id="focus-app-after-save" type="checkbox">
-          <span>保存后显示 Serpent 窗口</span>
+          <span class="setting-mark"></span>
+          <span>显示 Serpent 窗口</span>
         </label>
-        <label class="options-toggle">
+        <label class="setting-row">
           <input id="reveal-in-library-after-save" type="checkbox">
-          <span>保存后跳转到目标文件夹并选中文件</span>
+          <span class="setting-mark"></span>
+          <span>跳转到目标文件夹并选中文件</span>
         </label>
-        <label class="options-toggle">
+        <label class="setting-row">
           <input id="drag-radial-menu-enabled" type="checkbox">
-          <span>拖拽网页图片/视频时显示树状保存菜单</span>
+          <span class="setting-mark"></span>
+          <span>拖拽图片或视频时显示树状菜单</span>
         </label>
       </section>
 

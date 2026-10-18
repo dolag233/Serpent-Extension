@@ -8,14 +8,16 @@
     "notifications",
     "storage",
     "alarms",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "activeTab"
   ],
   "host_permissions": [
     "http://127.0.0.1:19876/*",
     "http://127.0.0.1:19877/*",
     "http://127.0.0.1:19878/*",
     "http://*/*",
-    "https://*/*"
+    "https://*/*",
+    "<all_urls>"
   ],
   "content_scripts": [
     {
@@ -45,6 +47,27 @@
     ]
   },
   "options_page": "options.html",
+  "commands": {
+    "batch-save": {
+      "suggested_key": { "default": "Alt+1" },
+      "description": "批量收藏当前页"
+    },
+    "capture-area": {
+      "suggested_key": { "default": "Alt+2" },
+      "description": "截取区域"
+    },
+    "capture-visible": {
+      "suggested_key": { "default": "Alt+3" },
+      "description": "截取可见区域"
+    },
+    "capture-page": {
+      "suggested_key": { "default": "Alt+4" },
+      "description": "整页截图"
+    },
+    "capture-element": {
+      "description": "截取元件"
+    }
+  },
   "icons": {
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",

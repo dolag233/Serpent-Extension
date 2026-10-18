@@ -23,6 +23,7 @@ import {
   type SaveTargetKind,
 } from './preferences';
 import {
+  deliverSaveUpload,
   fetchSerpentCollections,
   fetchSerpentFolders,
   notificationForOutcome,
@@ -30,6 +31,7 @@ import {
   saveIntentFromContextMenu,
   saveMediaViaBrowser,
   type ExtensionCollectionOption,
+  type FetchedMedia,
   type SaveIntent,
   type UserNotification,
 } from './save-client';
@@ -46,12 +48,28 @@ const MENU_ROOT_ID = 'serpent-save';
 const MENU_ROOT_FOLDER_ID = 'serpent-save-root';
 const MENU_SEPARATOR_ID = 'serpent-save-sep';
 const MENU_NOTICE_ID = 'serpent-save-notice';
+const MENU_PAGE_ID = 'serpent-page';
+const PAGE_MENU_ITEMS = [
+  { id: 'serpent-page-batch', title: '批量收藏此页（Alt+1）' },
+  { id: 'serpent-page-visible', title: '截取可见区域（Alt+3）' },
+  { id: 'serpent-page-area', title: '截取区域（Alt+2）' },
+  { id: 'serpent-page-element', title: '截取元件' },
+  { id: 'serpent-page-full', title: '整页截图（Alt+4）' },
+] as const;
 const CONNECTION_ALARM = 'serpent-connection-check';
 const ICON_SIZES = [32, 48, 64, 128] as const;
 
 let notificationSequence = 0;
 let connectionState: 'connected' | 'disconnected' = 'disconnected';
 let dynamicFolderMenuIds: string[] = [];
+let pageActionsVisible = true;
+let saveMenuVisible = true;
+const SAVE_MENU_CONTEXTS = ['image', 'video', 'link'] as Array<
+  'image' | 'video' | 'link'
+>;
+const CAPTURE_GAP_MS = 600;
+let nextCaptureAt = 0;
+let captureQueue: Promise<void> = Promise.resolve();
 let folderMenuRefreshPromise: Promise<void> | null = null;
 
 async function readRecentFolderIds(): Promise<string[]> {
@@ -88,19 +106,29 @@ function collectionsAsFolderOptions(
 async function createMenuItem(properties: {
   id: string;
   title?: string;
-  contexts?: Array<'image' | 'video'>;
+  contexts?: Array<'image' | 'video' | 'page' | 'selection' | 'link'>;
   parentId?: string;
   enabled?: boolean;
   type?: 'normal' | 'separator';
-}): Promise<void> {
-  await browser.contextMenus.create(properties);
+}): Promise<boolean> {
+  try {
+    await browser.contextMenus.create(properties);
+    return true;
+  } catch {
+    // 重复 id，或父项已经不在。菜单重建不能把这次保存变成失败。
+    return false;
+  }
 }
 
 async function updateMenuItem(
   id: string,
-  properties: { title?: string; enabled?: boolean },
+  properties: { title?: string; enabled?: boolean; visible?: boolean },
 ): Promise<void> {
-  await browser.contextMenus.update(id, properties);
+  try {
+    await browser.contextMenus.update(id, properties);
+  } catch {
+    // 项已被移除或从未创建成功。下次重建会补上。
+  }
 }
 
 /** Root context-menu title reflects connection so disabled state is obvious. */
@@ -119,7 +147,30 @@ function setToolbarIcon(connected: boolean): void {
 }
 
 async function removeMenuItem(id: string): Promise<void> {
-  await browser.contextMenus.remove(id);
+  try {
+    await browser.contextMenus.remove(id);
+  } catch {
+    // 项已经不在菜单里。
+  }
+}
+
+async function createTrackedMenuItem(
+  properties: {
+    id: string;
+    title?: string;
+    contexts?: Array<'image' | 'video' | 'page' | 'selection' | 'link'>;
+    parentId?: string;
+    enabled?: boolean;
+    type?: 'normal' | 'separator';
+  },
+  createdIds: Set<string>,
+): Promise<boolean> {
+  if (createdIds.has(properties.id)) return false;
+  const created = await createMenuItem(properties);
+  if (!created) return false;
+  dynamicFolderMenuIds.push(properties.id);
+  createdIds.add(properties.id);
+  return true;
 }
 
 async function removeDynamicFolderMenus(): Promise<void> {
@@ -130,14 +181,119 @@ async function removeDynamicFolderMenus(): Promise<void> {
   }
 }
 
+function pageActionMessage(
+  menuItemId: string | number,
+): Record<string, unknown> | null {
+  switch (menuItemId) {
+    case 'serpent-page-batch':
+      return { type: 'serpent-open-batch' };
+    case 'serpent-page-visible':
+      return { type: 'serpent-start-capture', mode: 'visible' };
+    case 'serpent-page-area':
+      return { type: 'serpent-start-capture', mode: 'area' };
+    case 'serpent-page-element':
+      return { type: 'serpent-start-capture', mode: 'element' };
+    case 'serpent-page-full':
+      return { type: 'serpent-start-capture', mode: 'page' };
+    default:
+      return null;
+  }
+}
+
 async function createStaticMenus(): Promise<void> {
   const connected = connectionState === 'connected';
   await createMenuItem({
     id: MENU_ROOT_ID,
     title: saveMenuTitle(connected),
-    contexts: ['image', 'video'],
+    contexts: SAVE_MENU_CONTEXTS,
     enabled: connected,
   });
+  await createMenuItem({
+    id: MENU_PAGE_ID,
+    title: 'Serpent',
+    contexts: ['page', 'image', 'video'],
+  });
+  for (const item of PAGE_MENU_ITEMS) {
+    await createMenuItem({
+      id: item.id,
+      parentId: MENU_PAGE_ID,
+      title: item.title,
+      contexts: ['page', 'image', 'video'],
+    });
+  }
+  pageActionsVisible = true;
+  saveMenuVisible = true;
+}
+
+/** 采集菜单出现在空白处和图像、视频上；链接、选区、输入框除外。 */
+function pageActionsBelong(contexts: readonly string[]): boolean {
+  if (contexts.includes('image') || contexts.includes('video')) return true;
+  return !contexts.some((context) => (
+    context === 'audio'
+    || context === 'link'
+    || context === 'selection'
+    || context === 'editable'
+  ));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isCaptureQuotaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND');
+}
+
+/** Chrome 限制 captureVisibleTab 每秒 2 次。整页截图必须串行并留出间隔。 */
+async function captureVisibleTabPaced(windowId: number): Promise<string> {
+  const run = async (): Promise<string> => {
+    const waitFor = nextCaptureAt - Date.now();
+    if (waitFor > 0) await delay(waitFor);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const dataUrl = await browser.tabs.captureVisibleTab(windowId, { format: 'png' });
+        nextCaptureAt = Date.now() + CAPTURE_GAP_MS;
+        return dataUrl;
+      } catch (error) {
+        nextCaptureAt = Date.now() + (isCaptureQuotaError(error) ? 1000 : CAPTURE_GAP_MS);
+        if (!isCaptureQuotaError(error) || attempt === 1) throw error;
+        await delay(1000);
+      }
+    }
+    throw new Error('无法截取可见区域');
+  };
+  const scheduled = captureQueue.then(run);
+  captureQueue = scheduled.then(
+    () => undefined,
+    () => undefined,
+  );
+  return scheduled;
+}
+
+function storedContextMedia(value: unknown): { kind: 'image' | 'video'; mediaUrl: string } | null {
+  if (!value || typeof value !== 'object') return null;
+  const kind = Reflect.get(value, 'kind');
+  const mediaUrl = Reflect.get(value, 'mediaUrl');
+  if ((kind !== 'image' && kind !== 'video') || typeof mediaUrl !== 'string' || !mediaUrl) {
+    return null;
+  }
+  return { kind, mediaUrl };
+}
+
+async function linkClickHasMedia(tabId: number | undefined): Promise<boolean> {
+  if (tabId == null) return false;
+  const media = await browser.tabs.sendMessage(tabId, { type: 'serpent-context-media' }).catch(() => null);
+  return storedContextMedia(media) !== null;
+}
+
+function refreshOpenContextMenu(): void {
+  const menus = browser.contextMenus as typeof browser.contextMenus & {
+    refresh?: () => Promise<void>;
+  };
+  void menus.refresh?.();
 }
 
 async function syncSaveMenuEnabled(connected: boolean): Promise<void> {
@@ -160,43 +316,43 @@ async function createFolderSubmenu(
   parentId: string,
   folder: SaveMenuTreeFolder,
   selfTitle: string,
+  createdIds: Set<string>,
 ): Promise<void> {
   const id = folderMenuItemId(folder);
-  dynamicFolderMenuIds.push(id);
-  await createMenuItem({
+  if (createdIds.has(id)) return;
+  const created = await createTrackedMenuItem({
     id,
     parentId,
     title: folder.name,
-    contexts: ['image', 'video'],
+    contexts: SAVE_MENU_CONTEXTS,
     enabled: true,
-  });
+  }, createdIds);
+  if (!created) return;
   if (folder.children.length > 0 && folder.folderId !== null) {
     // contextMenus 父项点击只展开不保存；子菜单第一行提供保存到当前节点
     // （对齐拖拽树「松开 = 保存进该文件夹/合集」）。
     const selfId = folderMenuSelfId(folder.folderId);
-    dynamicFolderMenuIds.push(selfId);
-    await createMenuItem({
+    await createTrackedMenuItem({
       id: selfId,
       parentId: id,
       title: selfTitle,
-      contexts: ['image', 'video'],
+      contexts: SAVE_MENU_CONTEXTS,
       enabled: true,
-    });
+    }, createdIds);
   }
   for (const child of folder.children) {
-    await createFolderSubmenu(id, child, selfTitle);
+    await createFolderSubmenu(id, child, selfTitle, createdIds);
   }
 }
 
-async function createNoticeMenuItem(title: string): Promise<void> {
-  dynamicFolderMenuIds.push(MENU_NOTICE_ID);
-  await createMenuItem({
+async function createNoticeMenuItem(title: string, createdIds: Set<string>): Promise<void> {
+  await createTrackedMenuItem({
     id: MENU_NOTICE_ID,
     parentId: MENU_ROOT_ID,
     title,
-    contexts: ['image', 'video'],
+    contexts: SAVE_MENU_CONTEXTS,
     enabled: false,
-  });
+  }, createdIds);
 }
 
 async function listSaveTargets(kind: SaveTargetKind): Promise<
@@ -238,6 +394,7 @@ async function refreshFolderMenus(): Promise<void> {
   folderMenuRefreshPromise = (async () => {
     const connected = connectionState === 'connected';
     await syncSaveMenuEnabled(connected);
+    const createdIds = new Set<string>();
 
     if (!connected) {
       await removeDynamicFolderMenus();
@@ -249,7 +406,7 @@ async function refreshFolderMenus(): Promise<void> {
     if (listed.kind !== 'ok') {
       await removeDynamicFolderMenus();
       if (saveTargetKind === 'collection') {
-        await createNoticeMenuItem('无法读取合集');
+        await createNoticeMenuItem('无法读取合集', createdIds);
       }
       return;
     }
@@ -264,7 +421,7 @@ async function refreshFolderMenus(): Promise<void> {
     const selfTitle = saveTargetKind === 'collection' ? '保存到此合集' : '保存到此文件夹';
     const tree = buildSaveMenuTree(listed.folders, hints);
     if (saveTargetKind === 'collection' && tree.length === 0) {
-      await createNoticeMenuItem('尚无合集');
+      await createNoticeMenuItem('尚无合集', createdIds);
       return;
     }
 
@@ -274,22 +431,21 @@ async function refreshFolderMenus(): Promise<void> {
     const createRootParentMenu = async (): Promise<void> => {
       if (saveTargetKind !== 'folder' || rootParentCreated) return;
       rootParentCreated = true;
-      dynamicFolderMenuIds.push(MENU_ROOT_PARENT_ID);
-      await createMenuItem({
+      const parentCreated = await createTrackedMenuItem({
         id: MENU_ROOT_PARENT_ID,
         parentId: MENU_ROOT_ID,
         title: '根目录',
-        contexts: ['image', 'video'],
+        contexts: SAVE_MENU_CONTEXTS,
         enabled: true,
-      });
-      dynamicFolderMenuIds.push(MENU_ROOT_FOLDER_ID);
-      await createMenuItem({
+      }, createdIds);
+      if (!parentCreated) return;
+      await createTrackedMenuItem({
         id: MENU_ROOT_FOLDER_ID,
         parentId: MENU_ROOT_PARENT_ID,
         title: '保存至此',
-        contexts: ['image', 'video'],
+        contexts: SAVE_MENU_CONTEXTS,
         enabled: true,
-      });
+      }, createdIds);
     };
 
     let separatorCreated = false;
@@ -297,17 +453,16 @@ async function refreshFolderMenus(): Promise<void> {
       if (item.kind === 'separator') {
         if (separatorCreated) continue;
         separatorCreated = true;
-        dynamicFolderMenuIds.push(MENU_SEPARATOR_ID);
-        await createMenuItem({
+        await createTrackedMenuItem({
           id: MENU_SEPARATOR_ID,
           type: 'separator',
           parentId: MENU_ROOT_ID,
-          contexts: ['image', 'video'],
-        });
+          contexts: SAVE_MENU_CONTEXTS,
+        }, createdIds);
         await createRootParentMenu();
         continue;
       }
-      await createFolderSubmenu(MENU_ROOT_ID, item.folder, selfTitle);
+      await createFolderSubmenu(MENU_ROOT_ID, item.folder, selfTitle, createdIds);
     }
     if (!rootParentCreated) {
       await createRootParentMenu();
@@ -418,16 +573,23 @@ async function resolveSaveIntent(
   };
 }
 
-async function saveIntentAndNotify(intent: SaveIntent): Promise<UserNotification> {
+async function saveIntentAndNotify(
+  intent: SaveIntent,
+  options?: { quiet?: boolean; settle?: boolean },
+): Promise<UserNotification> {
   const resolved = await resolveSaveIntent(intent);
   if ('title' in resolved) {
-    showNotification(resolved);
+    if (!options?.quiet) showNotification(resolved);
     return resolved;
   }
 
   const behavior = await readExtensionSaveBehavior();
-  const outcome = await saveMediaViaBrowser(resolved, behavior);
-  if (outcome.kind === 'accepted') {
+  const keepDesktopFollowup = !options?.quiet || options.settle === true;
+  const effective = keepDesktopFollowup
+    ? behavior
+    : { ...behavior, focusAppAfterSave: false, revealInLibraryAfterSave: false };
+  const outcome = await saveMediaViaBrowser(resolved, effective);
+  if (outcome.kind === 'accepted' && keepDesktopFollowup) {
     if (resolved.targetCollectionId) {
       const collectionsOutcome = await fetchSerpentCollections();
       if (collectionsOutcome.kind === 'ok') {
@@ -439,7 +601,7 @@ async function saveIntentAndNotify(intent: SaveIntent): Promise<UserNotification
             new Set(collectionsOutcome.collections.map((collection) => collection.collectionId)),
           ),
         );
-        await refreshFolderMenus();
+        await refreshFolderMenus().catch(() => {});
       }
     } else {
       const foldersOutcome = await fetchSerpentFolders();
@@ -447,13 +609,155 @@ async function saveIntentAndNotify(intent: SaveIntent): Promise<UserNotification
         const folderId =
           typeof resolved.targetFolderId === 'string' ? resolved.targetFolderId : null;
         await rememberRecentFolder(folderId, foldersOutcome.folders);
-        await refreshFolderMenus();
+        await refreshFolderMenus().catch(() => {});
+      }
+    }
+  }
+  const notification = notificationForOutcome(outcome);
+  if (!options?.quiet) showNotification(notification);
+  return notification;
+}
+
+function arrayBufferFromDataUrl(dataUrl: string): { contentType: string; body: ArrayBuffer } | null {
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
+  if (!match?.[2]) return null;
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return { contentType: match[1] || 'image/png', body: bytes.buffer };
+}
+
+async function savePngDataUrl(
+  dataUrl: string,
+  filename: string,
+  sourcePageUrl: string,
+  targetFolderId: string | null | undefined,
+  targetCollectionId: string | undefined,
+): Promise<UserNotification> {
+  const decoded = arrayBufferFromDataUrl(dataUrl);
+  if (!decoded) {
+    const notification = { title: '无法保存截图', message: '截图数据无效。' };
+    showNotification(notification);
+    return notification;
+  }
+  const media: FetchedMedia = {
+    body: decoded.body,
+    contentType: 'image/png',
+    filename: filename.endsWith('.png') ? filename : `${filename}.png`,
+  };
+  const behavior = await readExtensionSaveBehavior();
+  const outcome = await deliverSaveUpload({
+    kind: 'image',
+    sourcePageUrl,
+    mediaUrl: sourcePageUrl,
+    ...(targetFolderId === null || typeof targetFolderId === 'string'
+      ? { targetFolderId }
+      : {}),
+    ...(targetCollectionId ? { targetCollectionId } : {}),
+  }, media, behavior);
+  if (outcome.kind === 'accepted') {
+    if (targetCollectionId) {
+      const collectionsOutcome = await fetchSerpentCollections();
+      if (collectionsOutcome.kind === 'ok') {
+        const recentCollectionIds = await readRecentCollectionIds();
+        await writeRecentCollectionIds(
+          pushRecentFolderId(
+            recentCollectionIds,
+            targetCollectionId,
+            new Set(collectionsOutcome.collections.map((collection) => collection.collectionId)),
+          ),
+        );
+        await refreshFolderMenus().catch(() => {});
+      }
+    } else if (targetFolderId === null || typeof targetFolderId === 'string') {
+      const foldersOutcome = await fetchSerpentFolders();
+      if (foldersOutcome.kind === 'ok') {
+        await rememberRecentFolder(
+          typeof targetFolderId === 'string' ? targetFolderId : null,
+          foldersOutcome.folders,
+        );
+        await refreshFolderMenus().catch(() => {});
       }
     }
   }
   const notification = notificationForOutcome(outcome);
   showNotification(notification);
   return notification;
+}
+
+async function saveBatch(
+  message: object,
+  tabId: number | undefined,
+): Promise<{ saved: number; failed: number; message: string }> {
+  if (connectionState !== 'connected') {
+    const notification = {
+      title: '无法保存到 Serpent',
+      message: '请先启动 Serpent 桌面应用并打开资源库。',
+    };
+    showNotification(notification);
+    return { saved: 0, failed: 0, message: notification.message };
+  }
+  const sourcePageUrl = Reflect.get(message, 'sourcePageUrl');
+  const items = Reflect.get(message, 'items');
+  const targetFolderId = Reflect.get(message, 'targetFolderId');
+  const targetCollectionId = Reflect.get(message, 'targetCollectionId');
+  if (typeof sourcePageUrl !== 'string' || !Array.isArray(items)) {
+    return { saved: 0, failed: 0, message: '保存请求无效' };
+  }
+  const queue = items.slice(0, 200);
+  const token = Reflect.get(message, 'token');
+  const report = (done: number, total: number) => {
+    if (tabId == null || typeof token !== 'number') return;
+    void browser.tabs.sendMessage(tabId, {
+      type: 'serpent-batch-progress',
+      token,
+      done,
+      total,
+    }).catch(() => {});
+  };
+  let saved = 0;
+  let failed = 0;
+  let failure = '';
+  report(0, queue.length);
+  for (let index = 0; index < queue.length; index += 1) {
+    const item = queue[index];
+    if (!item || typeof item !== 'object') {
+      failed += 1;
+      continue;
+    }
+    const kind = Reflect.get(item, 'kind');
+    const mediaUrl = Reflect.get(item, 'mediaUrl');
+    if ((kind !== 'image' && kind !== 'video') || typeof mediaUrl !== 'string') {
+      failed += 1;
+      continue;
+    }
+    const notification = await saveIntentAndNotify({
+      kind,
+      sourcePageUrl,
+      mediaUrl,
+      ...(targetFolderId === null || typeof targetFolderId === 'string'
+        ? { targetFolderId }
+        : {}),
+      ...(typeof targetCollectionId === 'string' && targetCollectionId
+        ? { targetCollectionId }
+        : {}),
+    }, { quiet: true, settle: index === queue.length - 1 });
+    if (notification.title === '已发送到 Serpent') saved += 1;
+    else {
+      failed += 1;
+      failure = notification.message;
+      report(index + 1, queue.length);
+      break;
+    }
+    report(index + 1, queue.length);
+  }
+  const summary = failed === 0
+    ? `已发送 ${saved} 个文件`
+    : `已发送 ${saved} 个，失败 ${failed} 个。${failure}`;
+  showNotification({ title: '批量收藏', message: summary });
+  return { saved, failed, message: summary };
 }
 
 /** 把保存进度/结果气泡发送到当前标签页（无 content script 时静默忽略）。 */
@@ -473,6 +777,21 @@ function notifySaveFeedback(
 async function handleContextMenuClick(
   info: SerpentContextMenuClickData,
 ): Promise<void> {
+  const pageMessage = pageActionMessage(info.menuItemId);
+  if (pageMessage) {
+    const tabId = info.tab?.id;
+    if (tabId == null) return;
+    try {
+      await browser.tabs.sendMessage(tabId, pageMessage);
+    } catch {
+      showNotification({
+        title: '无法在此页面使用',
+        message: '请在普通网页上使用采集功能。',
+      });
+    }
+    return;
+  }
+
   if (connectionState !== 'connected') {
     showNotification({
       title: '无法保存到 Serpent',
@@ -489,11 +808,23 @@ async function handleContextMenuClick(
   const targetFolderId = parseFolderMenuId(info.menuItemId);
   if (targetFolderId === undefined) return;
 
-  const intent = saveIntentFromContextMenu({
+  let intent = saveIntentFromContextMenu({
     mediaType: info.mediaType,
     pageUrl: info.pageUrl,
     srcUrl: info.srcUrl,
   });
+  if (!intent && info.tab?.id != null && typeof info.pageUrl === 'string') {
+    const media = storedContextMedia(
+      await browser.tabs.sendMessage(info.tab.id, { type: 'serpent-context-media' }).catch(() => null),
+    );
+    if (media) {
+      intent = {
+        kind: media.kind,
+        sourcePageUrl: info.pageUrl,
+        mediaUrl: media.mediaUrl,
+      };
+    }
+  }
   if (!intent) {
     showNotification({
       title: '无法保存到 Serpent',
@@ -540,7 +871,10 @@ browser.storage.onChanged.addListener((changes, areaName) => {
 // Promise-returning onMessage listener: webextension-polyfill resolves the
 // promise as the response on both Chromium and Firefox (Firefox's native
 // browser.onMessage supports the same contract).
-browser.runtime.onMessage.addListener(async (message: unknown) => {
+browser.runtime.onMessage.addListener(async (
+  message: unknown,
+  sender: { tab?: { id?: number } },
+) => {
   if (!message || typeof message !== 'object') return undefined;
 
   const type = Reflect.get(message, 'type');
@@ -630,14 +964,94 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
     return { notification };
   }
 
+  if (type === 'serpent-save-batch') {
+    return saveBatch(message, sender.tab?.id);
+  }
+
+  if (type === 'serpent-capture-viewport') {
+    try {
+      const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+      if (tab?.windowId == null) throw new Error('无法截取可见区域');
+      const dataUrl = await captureVisibleTabPaced(tab.windowId);
+      return { dataUrl };
+    } catch (error) {
+      return {
+        message: error instanceof Error ? error.message : '无法截取可见区域',
+      };
+    }
+  }
+
+  if (type === 'serpent-save-png') {
+    const dataUrl = Reflect.get(message, 'dataUrl');
+    const filename = Reflect.get(message, 'filename');
+    const sourcePageUrl = Reflect.get(message, 'sourcePageUrl');
+    const targetFolderId = Reflect.get(message, 'targetFolderId');
+    const targetCollectionId = Reflect.get(message, 'targetCollectionId');
+    if (typeof dataUrl !== 'string' || typeof sourcePageUrl !== 'string') {
+      return { notification: { title: '无法保存截图', message: '截图数据无效。' } };
+    }
+    const notification = await savePngDataUrl(
+      dataUrl,
+      typeof filename === 'string' ? filename : 'serpent-screenshot.png',
+      sourcePageUrl,
+      targetFolderId === null || typeof targetFolderId === 'string' ? targetFolderId : undefined,
+      typeof targetCollectionId === 'string' && targetCollectionId ? targetCollectionId : undefined,
+    );
+    return { notification };
+  }
+
   return undefined;
 });
 
-if (browser.contextMenus.onShown) {
-  browser.contextMenus.onShown.addListener((info) => {
-    if (info.contexts.includes('image') || info.contexts.includes('video')) {
-      void refreshConnectionState();
+browser.commands.onCommand.addListener((command) => {
+  void (async () => {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    const tabId = tabs[0]?.id;
+    if (tabId == null) return;
+    if (command === 'batch-save') {
+      await browser.tabs.sendMessage(tabId, { type: 'serpent-open-batch' }).catch(() => {});
+      return;
     }
+    const mode = command === 'capture-area'
+      ? 'area'
+      : command === 'capture-visible'
+        ? 'visible'
+        : command === 'capture-page'
+          ? 'page'
+          : command === 'capture-element'
+            ? 'element'
+            : null;
+    if (!mode) return;
+    await browser.tabs.sendMessage(tabId, { type: 'serpent-start-capture', mode }).catch(() => {});
+  })();
+});
+
+if (browser.contextMenus.onShown) {
+  browser.contextMenus.onShown.addListener((info, tab) => {
+    const contexts = info.contexts;
+    const showPageActions = pageActionsBelong(contexts);
+    const onNativeMedia = contexts.includes('image') || contexts.includes('video');
+    void (async () => {
+      let showSave = onNativeMedia;
+      let saveVisibilityKnown = onNativeMedia;
+      if (!onNativeMedia && contexts.includes('link')) {
+        showSave = await linkClickHasMedia(tab?.id);
+        saveVisibilityKnown = true;
+      }
+      const updates: Promise<void>[] = [];
+      if (showPageActions !== pageActionsVisible) {
+        pageActionsVisible = showPageActions;
+        updates.push(updateMenuItem(MENU_PAGE_ID, { visible: showPageActions }));
+      }
+      if (saveVisibilityKnown && showSave !== saveMenuVisible) {
+        saveMenuVisible = showSave;
+        updates.push(updateMenuItem(MENU_ROOT_ID, { visible: showSave }));
+      }
+      if (updates.length === 0) return;
+      await Promise.all(updates);
+      refreshOpenContextMenu();
+    })();
+    if (onNativeMedia) void refreshConnectionState();
   });
 }
 

@@ -396,6 +396,120 @@ export function sniffContentType(body: ArrayBuffer): string | undefined {
   return undefined;
 }
 
+function highestPlaylistVariant(playlist: string): { uri: string; bandwidth: number } | null {
+  const lines = playlist.split(/\r?\n/);
+  let pending: number | null = null;
+  let best: { uri: string; bandwidth: number } | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#EXT-X-STREAM-INF:')) {
+      const match = /BANDWIDTH=(\d+)/.exec(trimmed);
+      pending = match ? Number(match[1]) : 0;
+      continue;
+    }
+    if (trimmed.startsWith('#')) continue;
+    if (pending === null) continue;
+    if (!best || pending > best.bandwidth) best = { uri: trimmed, bandwidth: pending };
+    pending = null;
+  }
+  return best;
+}
+
+function singleFileFromMediaPlaylist(playlist: string, baseUrl: string): string | null {
+  const files = new Set<string>();
+  const add = (value: string) => {
+    try {
+      files.add(new URL(value, baseUrl).href);
+    } catch {
+      // Ignore a malformed playlist entry.
+    }
+  };
+  for (const line of playlist.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#')) {
+      const map = /URI="([^"]+)"/.exec(trimmed);
+      if (map?.[1]) add(map[1]);
+      continue;
+    }
+    add(trimmed);
+  }
+  if (files.size !== 1) return null;
+  return [...files][0] ?? null;
+}
+
+/** Pinterest 的 master m3u8 旁有同名渐进式 mp4：`/hls/id.m3u8` → `/expMp4/id_720w.mp4`。 */
+function pinterestProgressiveMp4(masterUrl: string, variantUri: string): string | null {
+  let variant: URL;
+  try {
+    variant = new URL(variantUri, masterUrl);
+  } catch {
+    return null;
+  }
+  if (!variant.hostname.endsWith('pinimg.com')) return null;
+  if (!variant.pathname.includes('/hls/')) return null;
+  const file = variant.pathname.split('/').pop() ?? '';
+  if (!file.endsWith('.m3u8')) return null;
+  const nextPath = variant.pathname
+    .replace('/hls/', '/expMp4/')
+    .replace(/[^/]+$/, file.replace(/\.m3u8$/, '.mp4'));
+  return `${variant.origin}${nextPath}`;
+}
+
+async function responseText(response: FetchResponse): Promise<string | null> {
+  if (!response.ok) return null;
+  try {
+    return await response.text();
+  } catch {
+    return null;
+  }
+}
+
+async function urlLooksLikeVideo(url: string, fetchFn: FetchFunction): Promise<boolean> {
+  try {
+    const response = await fetchFn(url, { method: 'HEAD' });
+    const contentType = response.headers.get('content-type') ?? '';
+    return response.ok && contentType.toLowerCase().startsWith('video/');
+  } catch {
+    return false;
+  }
+}
+
+async function resolveStreamUrl(url: string, fetchFn: FetchFunction): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  if (!parsed.pathname.toLowerCase().endsWith('.m3u8')) return url;
+
+  let master: string | null;
+  try {
+    master = await responseText(await fetchFn(url, { method: 'GET' }));
+  } catch {
+    return url;
+  }
+  if (!master) return url;
+
+  const variant = highestPlaylistVariant(master);
+  if (!variant) return singleFileFromMediaPlaylist(master, url) ?? url;
+
+  const mp4 = pinterestProgressiveMp4(url, variant.uri);
+  if (mp4 && await urlLooksLikeVideo(mp4, fetchFn)) return mp4;
+
+  const variantUrl = new URL(variant.uri, url).href;
+  if (!new URL(variantUrl).pathname.toLowerCase().endsWith('.m3u8')) return variantUrl;
+  try {
+    const media = await responseText(await fetchFn(variantUrl, { method: 'GET' }));
+    if (media) return singleFileFromMediaPlaylist(media, variantUrl) ?? variantUrl;
+  } catch {
+    // Keep the variant playlist if the media playlist cannot be read.
+  }
+  return variantUrl;
+}
+
 /**
  * Fetch media in the browser with cookies + page referrer (Serpent-1jyi).
  * This is the anti-hotlink path; Serpent no longer re-downloads the URL.
@@ -404,9 +518,10 @@ export async function fetchMediaInBrowser(
   intent: SaveIntent,
   fetchFn: FetchFunction = fetch,
 ): Promise<FetchedMedia | { error: string }> {
+  const mediaUrl = await resolveStreamUrl(intent.mediaUrl, fetchFn);
   let response: FetchResponse;
   try {
-    response = await fetchFn(intent.mediaUrl, {
+    response = await fetchFn(mediaUrl, {
       method: 'GET',
       credentials: 'include',
       referrer: intent.sourcePageUrl,
@@ -448,7 +563,7 @@ export async function fetchMediaInBrowser(
   }
 
   const filename = alignFilenameWithContentType(
-    filenameFromUrl(intent.mediaUrl, contentType),
+    filenameFromUrl(mediaUrl, contentType),
     contentType,
   );
 

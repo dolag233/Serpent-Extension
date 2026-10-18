@@ -1,5 +1,11 @@
 import browser from 'webextension-polyfill';
 
+import {
+  BATCH_TARGET_KEY,
+  batchTargetFromStored,
+  type BatchTargetState,
+} from './batch-model';
+
 export const NOTIFICATIONS_ENABLED_KEY = 'serpentNotificationsEnabled';
 export const FOCUS_APP_AFTER_SAVE_KEY = 'serpentFocusAppAfterSave';
 export const REVEAL_IN_LIBRARY_AFTER_SAVE_KEY = 'serpentRevealInLibraryAfterSave';
@@ -93,4 +99,84 @@ export async function readSaveTargetKind(): Promise<SaveTargetKind> {
 
 export async function writeSaveTargetKind(kind: SaveTargetKind): Promise<void> {
   await browser.storage.sync.set({ [SAVE_TARGET_KIND_KEY]: kind });
+}
+
+export const BATCH_FILTER_KEY = 'serpentBatchFilter';
+
+export const BATCH_FORMATS = [
+  'jpg',
+  'png',
+  'gif',
+  'webp',
+  'avif',
+  'svg',
+  'bmp',
+  'mp4',
+  'webm',
+] as const;
+
+export type BatchFormat = (typeof BATCH_FORMATS)[number];
+
+export type BatchFilterSettings = {
+  minEdge: number;
+  formats: BatchFormat[];
+  preferHd: boolean;
+};
+
+export const DEFAULT_BATCH_FILTER: BatchFilterSettings = {
+  minEdge: 200,
+  formats: [...BATCH_FORMATS],
+  preferHd: true,
+};
+
+function isBatchFormat(value: string): value is BatchFormat {
+  return (BATCH_FORMATS as readonly string[]).includes(value);
+}
+
+export function batchFilterFromStored(value: unknown): BatchFilterSettings {
+  if (!value || typeof value !== 'object') return { ...DEFAULT_BATCH_FILTER, formats: [...BATCH_FORMATS] };
+  const minEdgeRaw = Reflect.get(value, 'minEdge');
+  const formatsRaw = Reflect.get(value, 'formats');
+  const preferHdRaw = Reflect.get(value, 'preferHd');
+  const minEdge = typeof minEdgeRaw === 'number' && Number.isFinite(minEdgeRaw)
+    ? Math.max(0, Math.min(8000, Math.floor(minEdgeRaw)))
+    : DEFAULT_BATCH_FILTER.minEdge;
+  const formats = Array.isArray(formatsRaw)
+    ? formatsRaw.filter((entry): entry is BatchFormat => typeof entry === 'string' && isBatchFormat(entry))
+    : [...BATCH_FORMATS];
+  return {
+    minEdge,
+    formats,
+    preferHd: preferHdRaw !== false,
+  };
+}
+
+export async function readBatchFilter(): Promise<BatchFilterSettings> {
+  const values = await browser.storage.sync.get(BATCH_FILTER_KEY);
+  return batchFilterFromStored(values[BATCH_FILTER_KEY]);
+}
+
+export async function writeBatchFilter(settings: BatchFilterSettings): Promise<void> {
+  await browser.storage.sync.set({ [BATCH_FILTER_KEY]: settings });
+}
+
+export async function readBatchTarget(): Promise<BatchTargetState> {
+  const values = await browser.storage.local.get(BATCH_TARGET_KEY);
+  return batchTargetFromStored(values[BATCH_TARGET_KEY]);
+}
+
+export async function rememberBatchTarget(
+  kind: SaveTargetKind,
+  id: string | null,
+): Promise<void> {
+  const values = await browser.storage.local.get(BATCH_TARGET_KEY);
+  const current = values[BATCH_TARGET_KEY];
+  const base: Record<string, unknown> =
+    current && typeof current === 'object'
+      ? { ...(current as Record<string, unknown>) }
+      : {};
+  const key = kind === 'folder' ? 'folderId' : 'collectionId';
+  await browser.storage.local.set({
+    [BATCH_TARGET_KEY]: { ...base, [key]: id },
+  });
 }

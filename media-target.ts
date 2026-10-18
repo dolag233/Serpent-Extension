@@ -111,14 +111,83 @@ export function mediaUrlFromVideo(video: HTMLVideoElement): string | undefined {
   return undefined;
 }
 
+function isRemoteVideoUrl(url: string): boolean {
+  try {
+    return /\.(?:mp4|m4v|webm|mov|m3u8)$/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function videoUrlScore(url: string): number {
+  let score = 0;
+  if (/\.mp4$/i.test(new URL(url).pathname)) score += 10_000;
+  else if (/\.m3u8$/i.test(new URL(url).pathname)) score += 1_000;
+  const width = /_(\d{3,4})w(?:\.|$)/i.exec(new URL(url).pathname);
+  if (width?.[1]) score += Number(width[1]);
+  return score;
+}
+
+function pushHttpUrls(text: string, into: string[]): void {
+  const normalized = text.replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+  for (const match of normalized.matchAll(/https?:\/\/[^\s"'<>\\]+/g)) {
+    const url = match[0].replace(/[),.;]+$/, '');
+    if (isHttpUrl(url)) into.push(url);
+  }
+}
+
+/** 播放器把地址换成 blob: 之后，从已发起的请求和页面数据里找回原始视频地址。 */
+function remoteVideoUrls(doc: Document): string[] {
+  const found: string[] = [];
+  const entries = doc.defaultView?.performance?.getEntriesByType?.('resource') ?? [];
+  for (const entry of entries) {
+    if (typeof entry.name === 'string') pushHttpUrls(entry.name, found);
+  }
+  const fromNetwork = found.filter(isRemoteVideoUrl);
+  if (fromNetwork.length > 0) return fromNetwork;
+
+  for (const script of doc.scripts) {
+    pushHttpUrls(script.textContent ?? '', found);
+  }
+  const og = doc.querySelector('meta[property="og:image"]')?.getAttribute('content');
+  if (og) pushHttpUrls(og, found);
+  return found.filter(isRemoteVideoUrl);
+}
+
+function bestRemoteVideoUrl(urls: readonly string[], hint?: string): string | undefined {
+  const unique = [...new Set(urls)];
+  if (unique.length === 0) return undefined;
+  const hintId = hint ? /([a-f0-9]{32})/i.exec(hint)?.[1]?.toLowerCase() : undefined;
+  const ranked = [...unique].sort((left, right) => videoUrlScore(right) - videoUrlScore(left));
+  if (hintId) {
+    const matched = ranked.find((url) => url.toLowerCase().includes(hintId));
+    if (matched) return matched;
+  }
+  return ranked[0];
+}
+
+function fallbackVideoUrl(video: HTMLVideoElement): string | undefined {
+  const rect = video.getBoundingClientRect();
+  if (rect.width < 80 || rect.height < 80) return undefined;
+  return bestRemoteVideoUrl(remoteVideoUrls(video.ownerDocument), video.poster);
+}
+
+function fallbackImageUrl(img: HTMLImageElement): string | undefined {
+  const rect = img.getBoundingClientRect();
+  if (rect.width < 180 || rect.height < 180) return undefined;
+  const content = img.ownerDocument.querySelector('meta[property="og:image"]')?.getAttribute('content')
+    ?? img.ownerDocument.querySelector('link[rel="preload"][as="image"]')?.getAttribute('href');
+  return isHttpUrl(content) ? content : undefined;
+}
+
 export function mediaFromElement(element: Element): MediaTarget | null {
   if (element instanceof HTMLImageElement) {
-    const mediaUrl = mediaUrlFromImage(element);
+    const mediaUrl = mediaUrlFromImage(element) ?? fallbackImageUrl(element);
     return mediaUrl ? { kind: 'image', mediaUrl } : null;
   }
 
   if (element instanceof HTMLVideoElement) {
-    const mediaUrl = mediaUrlFromVideo(element);
+    const mediaUrl = mediaUrlFromVideo(element) ?? fallbackVideoUrl(element);
     return mediaUrl ? { kind: 'video', mediaUrl } : null;
   }
 
