@@ -79,9 +79,22 @@ async function validateBuild(outDir, target) {
   if (!contentScript?.js?.includes('content-script.js')) {
     throw new Error('Extension manifest must register content-script.js on http(s) pages');
   }
+  const hasPageBridge = manifest.content_scripts?.some((entry) => entry.js?.includes('page-bridge.js'));
+  if (hasPageBridge && !manifest.content_scripts.some((entry) => entry.world === 'MAIN')) {
+    throw new Error('page-bridge.js must run in MAIN world');
+  }
+  if (hasPageBridge) {
+    const bridgeMatches = manifest.content_scripts.find((entry) => entry.js?.includes('page-bridge.js'))?.matches ?? [];
+    for (const xMatch of ['*://x.com/*', '*://*.x.com/*', '*://twitter.com/*', '*://*.twitter.com/*']) {
+      if (!bridgeMatches.includes(xMatch)) {
+        throw new Error(`page-bridge.js must include the X host match ${xMatch}`);
+      }
+    }
+  }
 
   await assertFile(outDir, 'background.js');
   await assertFile(outDir, 'content-script.js');
+  if (hasPageBridge) await assertFile(outDir, 'page-bridge.js');
   await assertFile(outDir, 'options.js');
   await assertFile(outDir, 'options.html');
   await assertFile(outDir, 'options.css');
@@ -95,7 +108,7 @@ async function validateBuild(outDir, target) {
   // 三个脚本都必须是自包含单文件。多入口同一次构建会让 Rollup 抽取共享 chunk，
   // 产物首行出现 import 语句；Chrome content script 与 Firefox event page
   // 都不能是 ES module，整个脚本会解析失败、静默失效（2026-07-25 实测事故）。
-  for (const relativePath of ['background.js', 'content-script.js', 'options.js', 'popup.js']) {
+  for (const relativePath of ['background.js', 'content-script.js', 'options.js', 'popup.js', 'page-bridge.js']) {
     const source = await readFile(path.join(outDir, relativePath), 'utf8');
     if (/^(?:import|export)\s/m.test(source)) {
       throw new Error(
@@ -132,6 +145,7 @@ async function validateBuild(outDir, target) {
 const scriptEntries = [
   { name: 'background', format: 'es' },
   { name: 'content-script', format: 'iife' },
+  { name: 'page-bridge', format: 'iife' },
   { name: 'options', format: 'es' },
   { name: 'popup', format: 'es' },
 ];

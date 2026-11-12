@@ -14,7 +14,7 @@ async function runOnPage(message: Record<string, unknown>): Promise<void> {
     return;
   }
   try {
-    await browser.tabs.sendMessage(tabId, message);
+    await browser.tabs.sendMessage(tabId, message, { frameId: 0 });
     window.close();
   } catch {
     if (statusEl) statusEl.textContent = '这个页面不能使用采集功能';

@@ -11,13 +11,16 @@
     "sign:firefox": "node scripts/sign-firefox.mjs",
     "release:firefox": "npm run extension:build && npm run extension:lint:firefox && npm run sign:firefox",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test:original-media:unit": "node scripts/test-original-media-unit.mjs",
+    "test:original-media:browser": "npm run extension:build && node scripts/test-original-media-browser.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/webextension-polyfill": "^0.12.5",
     "eslint": "10.7.0",
     "globals": "17.7.0",
+    "playwright": "1.61.1",
     "sharp": "^0.35.3",
     "typescript": "6.0.3",
     "typescript-eslint": "8.63.0",
@@ -25,6 +28,8 @@
     "web-ext": "^10.6.0"
   },
   "dependencies": {
+    "@xmldom/xmldom": "^0.9.12",
+    "parse5": "^8.1.1",
     "webextension-polyfill": "^0.12.0"
   }
 }

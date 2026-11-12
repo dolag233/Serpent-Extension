@@ -5,6 +5,20 @@ import {
   batchTargetFromStored,
   type BatchTargetState,
 } from './batch-model';
+import {
+  BATCH_FILTER_KEY,
+  migratePreferOriginalMedia as migratePreferOriginalMediaWithStorage,
+  PREFER_ORIGINAL_MEDIA_KEY,
+  preferOriginalMediaFromStored,
+  type SyncStorageLike,
+} from './media-resolution/preferences';
+
+export {
+  BATCH_FILTER_KEY,
+  PREFER_ORIGINAL_MEDIA_KEY,
+  preferOriginalMediaFromStored,
+  type SyncStorageLike,
+};
 
 export const NOTIFICATIONS_ENABLED_KEY = 'serpentNotificationsEnabled';
 export const FOCUS_APP_AFTER_SAVE_KEY = 'serpentFocusAppAfterSave';
@@ -101,7 +115,19 @@ export async function writeSaveTargetKind(kind: SaveTargetKind): Promise<void> {
   await browser.storage.sync.set({ [SAVE_TARGET_KIND_KEY]: kind });
 }
 
-export const BATCH_FILTER_KEY = 'serpentBatchFilter';
+export async function writePreferOriginalMedia(enabled: boolean): Promise<void> {
+  await browser.storage.sync.set({ [PREFER_ORIGINAL_MEDIA_KEY]: enabled });
+}
+
+export function migratePreferOriginalMedia(
+  storage: SyncStorageLike = browser.storage.sync,
+): Promise<boolean> {
+  return migratePreferOriginalMediaWithStorage(storage);
+}
+
+export function readPreferOriginalMedia(): Promise<boolean> {
+  return migratePreferOriginalMedia();
+}
 
 export const BATCH_FORMATS = [
   'jpg',
@@ -120,13 +146,11 @@ export type BatchFormat = (typeof BATCH_FORMATS)[number];
 export type BatchFilterSettings = {
   minEdge: number;
   formats: BatchFormat[];
-  preferHd: boolean;
 };
 
 export const DEFAULT_BATCH_FILTER: BatchFilterSettings = {
   minEdge: 200,
   formats: [...BATCH_FORMATS],
-  preferHd: true,
 };
 
 function isBatchFormat(value: string): value is BatchFormat {
@@ -137,7 +161,6 @@ export function batchFilterFromStored(value: unknown): BatchFilterSettings {
   if (!value || typeof value !== 'object') return { ...DEFAULT_BATCH_FILTER, formats: [...BATCH_FORMATS] };
   const minEdgeRaw = Reflect.get(value, 'minEdge');
   const formatsRaw = Reflect.get(value, 'formats');
-  const preferHdRaw = Reflect.get(value, 'preferHd');
   const minEdge = typeof minEdgeRaw === 'number' && Number.isFinite(minEdgeRaw)
     ? Math.max(0, Math.min(8000, Math.floor(minEdgeRaw)))
     : DEFAULT_BATCH_FILTER.minEdge;
@@ -147,7 +170,6 @@ export function batchFilterFromStored(value: unknown): BatchFilterSettings {
   return {
     minEdge,
     formats,
-    preferHd: preferHdRaw !== false,
   };
 }
 

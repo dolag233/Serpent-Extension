@@ -12,10 +12,13 @@ import { buildSaveMenuFolderHints, type ExtensionFolderOption } from './folder-m
 import { mediaPassesFilter, collectPageMedia, type CollectedMedia } from './page-images';
 import {
   BATCH_FORMATS,
+  PREFER_ORIGINAL_MEDIA_KEY,
   readBatchFilter,
   readBatchTarget,
+  readPreferOriginalMedia,
   rememberBatchTarget,
   writeBatchFilter,
+  writePreferOriginalMedia,
   writeSaveTargetKind,
   type BatchFilterSettings,
 } from './preferences';
@@ -44,10 +47,12 @@ const ICONS: Record<string, string> = {
   close: '<path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>',
   all: '<rect x="2.5" y="2.5" width="11" height="11" rx="2"/><path d="M5 8.2 7 10.2 11 6"/>',
   none: '<rect x="2.5" y="2.5" width="11" height="11" rx="2"/>',
+  mixed: '<rect x="2.5" y="2.5" width="11" height="11" rx="2"/><path d="M5 8h6"/>',
   edge: '<path d="M5 2.5H3.5a1 1 0 0 0-1 1V5M11 2.5h1.5a1 1 0 0 1 1 1V5M5 13.5H3.5a1 1 0 0 1-1-1V11M11 13.5h1.5a1 1 0 0 0 1-1V11"/>',
   hd: '<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M5 10.2 7 8l1.4 1.4L10.2 7 12 9.6"/>',
   detect: '<path d="M1.8 8S4.2 4.6 8 4.6 14.2 8 14.2 8 11.8 11.4 8 11.4 1.8 8 1.8 8z"/><circle cx="8" cy="8" r="1.6"/>',
   save: '<path d="M8 2.6v6.2M5.6 6.6 8 9.1l2.4-2.5"/><path d="M3.2 11.2h9.6V13.6H3.2z"/>',
+  stop: '<rect x="3" y="3" width="10" height="10" rx="2"/>',
   folder: '<path d="M2.2 4.2h3.8l1.2 1.4h6.6v6.6H2.2z"/>',
   layers: '<path d="M8 2.4 13.2 5 8 7.6 2.8 5zM3.2 7.4 8 10l4.8-2.6M3.2 10.2 8 12.8l4.8-2.6"/>',
   back: '<path d="M10 3.5 5.5 8 10 12.5"/>',
@@ -84,13 +89,16 @@ const STYLE_TEXT = `
     stroke-linecap: round; stroke-linejoin: round;
   }
   .ico { width: 16px; height: 16px; display: block; }
-  .tool, .primary, .chip, .dest-back, .dest-drill {
+  .tool, .text-tool, .primary, .chip, .dest-back, .dest-drill {
     display: inline-flex; align-items: center; justify-content: center;
     border: 0; background: transparent; border-radius: 6px; cursor: pointer; color: #5c5f69;
   }
   .tool { width: 28px; height: 28px; padding: 0; }
-  .tool:hover, .dest-back:hover, .dest-drill:hover, .dest-name:hover { background: rgb(0 0 0 / 5.5%); color: #1a1b1e; }
-  .tool.is-on { background: color-mix(in srgb, #3b82f6 14%, #fff); color: #1d4ed8; }
+  .text-tool { flex: none; gap: 5px; min-height: 28px; padding: 0 7px; font-size: 12px; white-space: nowrap; }
+  .tool:hover, .text-tool:hover, .dest-back:hover, .dest-drill:hover, .dest-name:hover { background: rgb(0 0 0 / 5.5%); color: #1a1b1e; }
+  .tool.is-on, .tool.is-mixed, .text-tool.is-on { background: color-mix(in srgb, #3b82f6 14%, #fff); color: #1d4ed8; }
+  .selection-tool { flex: none; }
+  .selection-tool[aria-checked="mixed"] .ico { stroke-width: 2.25; }
   .primary { width: 32px; height: 32px; padding: 0; background: #3b82f6; color: #fff; border-radius: 8px; }
   .primary:hover { background: #2563eb; color: #fff; }
   .tools { display: grid; gap: 8px; padding: 8px 10px; background: #fff; border-bottom: 1px solid #ebecef; }
@@ -112,13 +120,13 @@ const STYLE_TEXT = `
   .chip:hover { border-color: #c9cbcf; }
   .chip.is-on { background: color-mix(in srgb, #3b82f6 12%, #fff); border-color: transparent; color: #1d4ed8; }
   .dest { display: grid; gap: 6px; }
-  .dest-line { display: flex; align-items: center; gap: 6px; }
+  .dest-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   .dest-kind {
     flex: none; height: 32px; padding: 0 8px;
     border: 1px solid #e1e2e6; border-radius: 8px; background: #fff; cursor: pointer;
   }
   .dest-current {
-    flex: 1; min-width: 0; height: 32px; display: flex; align-items: center; gap: 8px;
+    flex: 1 1 150px; min-width: 0; height: 32px; display: flex; align-items: center; gap: 8px;
     padding: 0 10px; border-radius: 8px; border: 1px solid #e1e2e6; background: #f7f7f8;
     cursor: pointer; text-align: left; color: #1a1b1e;
   }
@@ -139,21 +147,24 @@ const STYLE_TEXT = `
   .dest-name:disabled { color: #8b8f99; cursor: default; background: transparent; }
   .dest-sep { height: 1px; margin: 4px 8px; background: #ebecef; }
   .grid {
-    overflow: auto; display: grid;
+    overflow: auto; display: grid; flex: 1 1 auto; min-height: 0;
     grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+    grid-auto-rows: max-content; align-content: start;
     gap: 10px; padding: 12px;
     background: #f0f1f3;
   }
   .grid:has(.empty) { display: block; }
   .card {
-    position: relative; display: block; width: 100%; padding: 0; overflow: hidden;
+    position: relative; display: flex; flex-direction: column; align-items: stretch;
+    align-self: start; width: 100%; min-width: 0; height: auto; padding: 0; overflow: hidden;
     border: 1px solid transparent; border-radius: 8px; background: #fff;
     box-shadow: 0 1px 2px rgb(0 0 0 / 5%);
     cursor: pointer; text-align: left;
   }
   .card.is-on { border-color: #3b82f6; }
   .card img, .card .ph {
-    width: 100%; aspect-ratio: 1; object-fit: contain; display: block; background: #f3f4f6;
+    flex: 0 0 auto; width: 100%; height: auto; aspect-ratio: 1 / 1;
+    object-fit: contain; display: block; background: #f3f4f6;
   }
   .card .ph { display: flex; align-items: center; justify-content: center; color: #8b8f99; }
   .mark {
@@ -166,8 +177,10 @@ const STYLE_TEXT = `
     content: ""; display: block; width: 4px; height: 8px; margin: 1px 0 0 5px;
     border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg);
   }
-  .meta { padding: 4px 6px 6px; font-size: 11px; color: #8b8f99; }
+  .meta { flex: 0 0 auto; padding: 4px 6px 6px; font-size: 11px; color: #8b8f99; }
   .empty { margin: 0; padding: 28px 14px; color: #8b8f99; text-align: center; }
+  .tool-help { margin: -4px 4px 0; color: #737782; font-size: 11px; line-height: 1.35; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
   .progress {
     height: 4px; background: #ebecef; overflow: hidden;
   }
@@ -191,6 +204,7 @@ let detectTimer = 0;
 let onKey: ((event: KeyboardEvent) => void) | null = null;
 let onDocClick: ((event: MouseEvent) => void) | null = null;
 let progressToken = 0;
+let batchStoppingToken: number | null = null;
 let batchSaving = false;
 let progressTrack: HTMLElement | null = null;
 let progressBar: HTMLElement | null = null;
@@ -204,13 +218,22 @@ export function setBatchProgress(token: number, done: number, total: number): vo
   progressTrack.classList.add('is-busy');
   progressBar.style.width = `${(clamped / safeTotal) * 100}%`;
   progressTrack.setAttribute('aria-valuenow', String(Math.round((clamped / safeTotal) * 100)));
-  if (clamped < safeTotal) {
+  if (batchStoppingToken === token) {
+    progressStatus.textContent = '正在停止，已开始的任务完成后停止';
+  } else if (clamped < safeTotal) {
     progressStatus.textContent = `正在下载 ${Math.min(clamped + 1, safeTotal)} / ${safeTotal}`;
   }
 }
 
+function newBatchToken(): number {
+  const values = new Uint32Array(2);
+  crypto.getRandomValues(values);
+  return ((values[0]! & 0x1fffff) * 0x1_0000_0000 + values[1]!) || 1;
+}
+
 function beginBatchProgress(total: number): number {
-  progressToken += 1;
+  progressToken = newBatchToken();
+  batchStoppingToken = null;
   batchSaving = true;
   const safeTotal = Math.max(1, total);
   if (progressTrack && progressBar && progressStatus) {
@@ -225,7 +248,8 @@ function beginBatchProgress(total: number): number {
 }
 
 function endBatchProgress(): void {
-  progressToken += 1;
+  progressToken = -1;
+  batchStoppingToken = null;
   batchSaving = false;
   progressTrack?.classList.remove('is-busy');
   if (progressTrack) progressTrack.hidden = true;
@@ -234,6 +258,16 @@ function endBatchProgress(): void {
 
 function send<T>(message: Record<string, unknown>): Promise<T> {
   return browser.runtime.sendMessage(message) as Promise<T>;
+}
+
+function requestFailureMessage(error: unknown, operation: string): string {
+  const reason = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : '未知错误';
+  if (/extension context invalidated/iu.test(reason)) {
+    return '扩展已重新加载，当前页面中的批量面板已失效。请刷新此页面后重试。';
+  }
+  return `${operation}失败：${reason}`;
 }
 
 function closePanel(): void {
@@ -275,15 +309,16 @@ export function openBatchPanel(): void {
     </div>
     <div class="tools">
       <div class="row">
-        <button type="button" class="tool" data-action="all" title="全选" aria-label="全选">${icon('all')}</button>
-        <button type="button" class="tool" data-action="none" title="全不选" aria-label="全不选">${icon('none')}</button>
         <label class="edge" title="最短边">${icon('edge')}<span class="edge-label">最短边</span><input data-field="edge" type="number" min="0" max="8000" step="10" aria-label="最短边"></label>
-        <button type="button" class="tool" data-action="hd" title="优先高清" aria-label="优先高清">${icon('hd')}</button>
-        <button type="button" class="tool" data-action="detect" title="自动侦测" aria-label="自动侦测">${icon('detect')}</button>
+        <button type="button" class="text-tool is-on" data-action="hd" title="穿透保存默认开启，可关闭。优先保存原图或原视频；没有可用版本时保存当前预览。" aria-label="穿透保存" aria-describedby="hd-help" aria-pressed="true">${icon('hd')}<span>穿透保存</span></button>
+        <button type="button" class="text-tool" data-action="detect" title="监测并选中页面新加载且符合筛选的图片和视频；不会自动滚动或下载" aria-label="监测新媒体" aria-describedby="detect-help" aria-pressed="false">${icon('detect')}<span>监测新媒体</span></button>
       </div>
+      <span class="tool-help" id="detect-help">监测并选中页面新加载且符合筛选的图片和视频；不会自动滚动或下载。</span>
+      <span class="sr-only" id="hd-help">穿透保存默认开启，可关闭。优先保存原图或原视频；没有可用版本时保存当前预览。</span>
       <div class="formats" data-field="formats"></div>
       <div class="dest">
         <div class="dest-line">
+          <button type="button" class="tool selection-tool" data-action="all" title="全选" aria-label="全选" role="checkbox" aria-checked="false" disabled>${icon('none')}</button>
           <select class="dest-kind" data-field="dest-kind" aria-label="保存目标">
             <option value="folder">文件夹</option>
             <option value="collection">合集</option>
@@ -319,6 +354,7 @@ export function openBatchPanel(): void {
   const destTree = panel.querySelector<HTMLDivElement>('[data-field="dest-tree"]');
   const destBar = panel.querySelector<HTMLDivElement>('[data-field="dest-bar"]');
   const destList = panel.querySelector<HTMLDivElement>('[data-field="dest-list"]');
+  const selectionButton = panel.querySelector<HTMLButtonElement>('[data-action="all"]');
   const hdButton = panel.querySelector<HTMLButtonElement>('[data-action="hd"]');
   const detectButton = panel.querySelector<HTMLButtonElement>('[data-action="detect"]');
   const saveButton = panel.querySelector<HTMLButtonElement>('[data-action="save"]');
@@ -327,19 +363,21 @@ export function openBatchPanel(): void {
   progressStatus = status;
   if (
     !grid || !status || !foot || !edgeInput || !formatRow || !destKind || !destIcon
-    || !destLabel || !destTree || !destBar || !destList || !hdButton || !detectButton
+    || !destLabel || !destTree || !destBar || !destList || !selectionButton || !hdButton || !detectButton
     || !saveButton || !progressTrack || !progressBar
   ) return;
 
   let filter: BatchFilterSettings = {
     minEdge: 200,
     formats: [...BATCH_FORMATS],
-    preferHd: true,
   };
+  let preferOriginalMedia = true;
   let targetKind: 'folder' | 'collection' = 'folder';
   let items: CollectedMedia[] = [];
   let selected = new Set<string>();
   let detecting = false;
+  let runningBatchToken: number | null = null;
+  let stopPending = false;
   let level: TreeLevel = { kind: 'root' };
   let context: TreeMenuContext = {
     roots: [],
@@ -363,6 +401,20 @@ export function openBatchPanel(): void {
   const updateStatus = () => {
     const shown = visibleItems();
     const picked = countSelected(shown, selected);
+    const selectionState = shown.length === 0
+      ? 'false'
+      : picked === shown.length
+        ? 'true'
+        : picked > 0 ? 'mixed' : 'false';
+    selectionButton.disabled = shown.length === 0;
+    selectionButton.setAttribute('aria-checked', selectionState);
+    const canClear = selectionState === 'true';
+    const selectionLabel = canClear ? '取消全选' : '全选';
+    selectionButton.title = selectionLabel;
+    selectionButton.setAttribute('aria-label', selectionLabel);
+    selectionButton.classList.toggle('is-on', selectionState === 'true');
+    selectionButton.classList.toggle('is-mixed', selectionState === 'mixed');
+    selectionButton.innerHTML = icon(selectionState === 'true' ? 'all' : selectionState === 'mixed' ? 'mixed' : 'none');
     if (!batchSaving) setStatus(formatBatchStatus(picked, shown.length));
     const hidden = items.length - shown.length;
     foot.textContent = hidden > 0 ? `页面共 ${items.length}，已隐藏 ${hidden}` : '';
@@ -505,7 +557,7 @@ export function openBatchPanel(): void {
 
   const refresh = (selectNew: boolean) => {
     const previous = new Set(items.map((item) => item.key));
-    items = collectPageMedia(document, filter.preferHd);
+    items = collectPageMedia(document);
     if (selectNew) {
       for (const item of items) {
         if (!previous.has(item.key) && mediaPassesFilter(item, filter)) selected.add(item.key);
@@ -551,10 +603,18 @@ export function openBatchPanel(): void {
   });
 
   hdButton.addEventListener('click', () => {
-    filter = { ...filter, preferHd: !filter.preferHd };
-    hdButton.classList.toggle('is-on', filter.preferHd);
-    persist();
+    preferOriginalMedia = !preferOriginalMedia;
+    hdButton.classList.toggle('is-on', preferOriginalMedia);
+    hdButton.setAttribute('aria-pressed', String(preferOriginalMedia));
+    void writePreferOriginalMedia(preferOriginalMedia);
     refresh(true);
+  });
+
+  browser.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'sync' || !changes[PREFER_ORIGINAL_MEDIA_KEY]) return;
+    preferOriginalMedia = changes[PREFER_ORIGINAL_MEDIA_KEY].newValue !== false;
+    hdButton.classList.toggle('is-on', preferOriginalMedia);
+    hdButton.setAttribute('aria-pressed', String(preferOriginalMedia));
   });
 
   const stopDetect = () => {
@@ -562,6 +622,7 @@ export function openBatchPanel(): void {
     observer?.disconnect();
     observer = null;
     detectButton.classList.remove('is-on');
+    detectButton.setAttribute('aria-pressed', 'false');
   };
 
   detectButton.addEventListener('click', () => {
@@ -571,6 +632,7 @@ export function openBatchPanel(): void {
     }
     detecting = true;
     detectButton.classList.add('is-on');
+    detectButton.setAttribute('aria-pressed', 'true');
     observer = new MutationObserver((records) => {
       const outsidePanel = records.some((record) => {
         const target = record.target;
@@ -590,6 +652,7 @@ export function openBatchPanel(): void {
   });
 
   const saveSelected = async (): Promise<void> => {
+    if (batchSaving) return;
     const picked = visibleItems().filter((item) => selected.has(item.key)).slice(0, MAX_BATCH);
     if (picked.length === 0) {
       setStatus('没有选中的图片或视频');
@@ -603,7 +666,12 @@ export function openBatchPanel(): void {
     }
     setStatus(`正在下载 1 / ${picked.length}`);
     const token = beginBatchProgress(picked.length);
-    saveButton.disabled = true;
+    runningBatchToken = token;
+    stopPending = false;
+    saveButton.dataset.action = 'stop';
+    saveButton.title = '停止';
+    saveButton.setAttribute('aria-label', '停止');
+    saveButton.innerHTML = icon('stop');
     let response: { message?: string } | undefined;
     try {
       response = await send<{ saved: number; failed: number; message: string }>({
@@ -614,15 +682,47 @@ export function openBatchPanel(): void {
         ...(targetKind === 'collection' && destination.id
           ? { targetFolderId: null, targetCollectionId: destination.id }
           : {}),
-        items: picked.map((item) => ({ kind: item.kind, mediaUrl: item.saveUrl })),
+        items: picked.map((item) => ({
+          kind: item.kind,
+          mediaUrl: item.previewUrl,
+          selection: item.selection,
+        })),
       });
-    } catch {
-      response = { message: '保存失败' };
+    } catch (error) {
+      response = { message: requestFailureMessage(error, '批量保存请求') };
     }
-    saveButton.disabled = false;
     if (progressToken !== token) return;
     endBatchProgress();
+    runningBatchToken = null;
+    stopPending = false;
+    saveButton.dataset.action = 'save';
+    saveButton.title = '保存所选';
+    saveButton.setAttribute('aria-label', '保存所选');
+    saveButton.innerHTML = icon('save');
+    saveButton.disabled = false;
     setStatus(response?.message || '保存结束');
+  };
+
+  const stopSelectedBatch = (): void => {
+    const token = runningBatchToken;
+    if (token === null || stopPending || progressToken !== token) return;
+    stopPending = true;
+    batchStoppingToken = token;
+    saveButton.disabled = true;
+    saveButton.title = '正在停止';
+    saveButton.setAttribute('aria-label', '正在停止');
+    setStatus('正在停止，已开始的任务完成后停止');
+    void send<{ stopping: boolean }>({ type: 'serpent-stop-batch', token }).then((result) => {
+      if (progressToken === token && !result.stopping) setStatus('正在整理批量保存结果…');
+    }).catch((error: unknown) => {
+      if (progressToken !== token) return;
+      stopPending = false;
+      batchStoppingToken = null;
+      saveButton.disabled = false;
+      saveButton.title = '停止';
+      saveButton.setAttribute('aria-label', '停止');
+      setStatus(`${requestFailureMessage(error, '停止请求')}，批量保存仍在进行`);
+    });
   };
 
   onDocClick = (event: MouseEvent) => {
@@ -639,13 +739,17 @@ export function openBatchPanel(): void {
     const action = target?.closest<HTMLElement>('[data-action]')?.dataset.action;
     if (action === 'close') closePanel();
     else if (action === 'all') {
-      for (const item of visibleItems()) selected.add(item.key);
-      render();
-    } else if (action === 'none') {
-      for (const item of visibleItems()) selected.delete(item.key);
+      const shown = visibleItems();
+      if (countSelected(shown, selected) === shown.length) {
+        for (const item of shown) selected.delete(item.key);
+      } else {
+        for (const item of shown) selected.add(item.key);
+      }
       render();
     } else if (action === 'save') {
       if (!batchSaving) void saveSelected();
+    } else if (action === 'stop') {
+      stopSelectedBatch();
     } else if (action === 'dest-toggle') {
       destTree.hidden = !destTree.hidden;
       if (!destTree.hidden) renderDestinationList();
@@ -737,12 +841,18 @@ export function openBatchPanel(): void {
   });
 
   void (async () => {
-    filter = await readBatchFilter();
+    const [storedFilter, storedPreferOriginalMedia] = await Promise.all([
+      readBatchFilter(),
+      readPreferOriginalMedia(),
+    ]);
+    filter = storedFilter;
+    preferOriginalMedia = storedPreferOriginalMedia;
     edgeInput.value = String(filter.minEdge);
-    hdButton.classList.toggle('is-on', filter.preferHd);
+    hdButton.classList.toggle('is-on', preferOriginalMedia);
+    hdButton.setAttribute('aria-pressed', String(preferOriginalMedia));
     renderFormats();
     await loadTargets();
-    items = collectPageMedia(document, filter.preferHd);
+    items = collectPageMedia(document);
     selected = seedSelection(items, (item) => mediaPassesFilter(item, filter));
     render();
   })();

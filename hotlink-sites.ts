@@ -7,10 +7,8 @@
  * 已知防盗链 CDN 的 xmlhttprequest 请求注入目标站点认可的 Referer，扩展其余
  * 「background fetch + 上传 Serpent」流程不变。
  *
- * Firefox 兼容：Firefox 的 declarativeNetRequest 目前只支持静态规则集，不支持
- * 动态规则（updateDynamicRules/getDynamicRules）。本模块运行时先探测 API 是否
- * 可用，不可用则跳过（只记录 warning），不影响扩展其余功能——防盗链站点在
- * Firefox 下退回「无 Referer」行为，等待 Firefox 支持动态规则后再自动启用。
+ * Firefox 115+ 与 Chromium 均支持动态 DNR 规则。保留能力检测，避免在受限
+ * 浏览器环境下影响普通下载；Firefox 的最小版本不因本功能提升。
  *
  * 新站点接入：在 HOTLINK_SITES 追加一条 { label, hosts, referer }，重启扩展生效；
  * 规则注册幂等，重复启动不会叠加或冲突。Referer 值需以目标站实测为准
@@ -33,6 +31,11 @@ export const HOTLINK_SITES: readonly HotlinkSiteRule[] = [
     hosts: ['sinaimg.cn'],
     referer: 'https://weibo.com/',
   },
+  {
+    label: 'Pixiv',
+    hosts: ['pximg.net'],
+    referer: 'https://www.pixiv.net/',
+  },
 ];
 
 /** declarativeNetRequest modifyHeaders 规则的紧凑描述。 */
@@ -46,6 +49,7 @@ export interface HotlinkDnrRule {
   condition: {
     urlFilter: string;
     resourceTypes: string[];
+    initiatorDomains: string[];
   };
 }
 
@@ -66,10 +70,18 @@ const RULE_BASE_ID = 200000;
 const RULE_PRIORITY = 1;
 const HTTPS_REFERER = /^https:\/\//u;
 const HOST_PATTERN = /^[a-z0-9.-]+\.[a-z]{2,}$/u;
+const INITIATOR_DOMAIN_PATTERN = /^[a-z0-9.-]+$/u;
 
 export function buildHotlinkDnrRules(
-  sites: readonly HotlinkSiteRule[] = HOTLINK_SITES,
+  sites: readonly HotlinkSiteRule[],
+  extensionInitiatorDomain: string,
 ): HotlinkDnrRule[] {
+  const initiatorDomain = extensionInitiatorDomain.toLowerCase();
+  if (
+    !INITIATOR_DOMAIN_PATTERN.test(initiatorDomain) ||
+    initiatorDomain.startsWith('.') ||
+    initiatorDomain.endsWith('.')
+  ) throw new Error('Hotlink DNR requires the extension origin as its initiator domain');
   const rules: HotlinkDnrRule[] = [];
   for (const site of sites) {
     if (!HTTPS_REFERER.test(site.referer)) {
@@ -87,8 +99,9 @@ export function buildHotlinkDnrRules(
           requestHeaders: [{ header: 'referer', operation: 'set', value: site.referer }],
         },
         condition: {
-          urlFilter: `||${host}`,
+          urlFilter: `||${host}^`,
           resourceTypes: ['xmlhttprequest'],
+          initiatorDomains: [initiatorDomain],
         },
       });
     }
@@ -98,8 +111,8 @@ export function buildHotlinkDnrRules(
 
 /**
  * 幂等注册/更新动态规则：只回收本模块生成过的规则 id（>= RULE_BASE_ID），
- * 不触碰其他动态规则，然后写入当前 registry 的全量规则。Firefox 不支持
- * 动态规则时安全跳过，失败也仅记录 warning，不阻断扩展其余功能。
+ * 不触碰其他动态规则，然后写入当前 registry 的全量规则。环境缺少动态规则
+ * API 时安全跳过，失败也仅记录 warning，不阻断扩展其余功能。
  */
 export async function installHotlinkRules(
   sites: readonly HotlinkSiteRule[] = HOTLINK_SITES,
@@ -111,7 +124,8 @@ export async function installHotlinkRules(
     return;
   }
   try {
-    const rules = buildHotlinkDnrRules(sites);
+    const extensionInitiatorDomain = new URL(browser.runtime.getURL('/')).hostname;
+    const rules = buildHotlinkDnrRules(sites, extensionInitiatorDomain);
     const existing = await dnr.getDynamicRules();
     const ownIds = existing
       .filter((rule) => rule.id >= RULE_BASE_ID)

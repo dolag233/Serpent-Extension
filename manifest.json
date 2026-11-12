@@ -28,7 +28,28 @@
       "js": [
         "content-script.js"
       ],
+      "all_frames": true,
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://google.com/*",
+        "*://*.google.com/*",
+        "*://duckduckgo.com/*",
+        "*://*.duckduckgo.com/*",
+        "*://yandex.com/*",
+        "*://*.yandex.com/*",
+        "*://yandex.ru/*",
+        "*://*.yandex.ru/*",
+        "*://x.com/*",
+        "*://*.x.com/*",
+        "*://twitter.com/*",
+        "*://*.twitter.com/*"
+      ],
+      "js": ["page-bridge.js"],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "action": {

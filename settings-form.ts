@@ -7,6 +7,9 @@ import {
   focusAppAfterSaveFromStored,
   NOTIFICATIONS_ENABLED_KEY,
   notificationsEnabledFromStored,
+  PREFER_ORIGINAL_MEDIA_KEY,
+  preferOriginalMediaFromStored,
+  readPreferOriginalMedia,
   REVEAL_IN_LIBRARY_AFTER_SAVE_KEY,
   revealInLibraryAfterSaveFromStored,
   SAVE_TARGET_KIND_KEY,
@@ -14,6 +17,7 @@ import {
   writeDragRadialMenuEnabled,
   writeFocusAppAfterSave,
   writeNotificationsEnabled,
+  writePreferOriginalMedia,
   writeRevealInLibraryAfterSave,
   writeSaveTargetKind,
   type SaveTargetKind,
@@ -60,6 +64,9 @@ export function bindExtensionSettings(): void {
   const dragRadialMenuCheckbox = document.getElementById(
     'drag-radial-menu-enabled',
   ) as HTMLInputElement | null;
+  const preferOriginalMediaCheckbox = document.getElementById(
+    'prefer-original-media',
+  ) as HTMLInputElement | null;
   const saveTargetFolderRadio = document.getElementById(
     'save-target-folder',
   ) as HTMLInputElement | null;
@@ -73,12 +80,14 @@ export function bindExtensionSettings(): void {
   bindToggle(focusAppCheckbox, writeFocusAppAfterSave);
   bindToggle(revealInLibraryCheckbox, writeRevealInLibraryAfterSave);
   bindToggle(dragRadialMenuCheckbox, writeDragRadialMenuEnabled);
+  bindToggle(preferOriginalMediaCheckbox, writePreferOriginalMedia);
 
   void browser.storage.sync.get([
     NOTIFICATIONS_ENABLED_KEY,
     FOCUS_APP_AFTER_SAVE_KEY,
     REVEAL_IN_LIBRARY_AFTER_SAVE_KEY,
     DRAG_RADIAL_MENU_ENABLED_KEY,
+    PREFER_ORIGINAL_MEDIA_KEY,
     SAVE_TARGET_KIND_KEY,
   ]).then((values) => {
     if (notificationsCheckbox) {
@@ -100,6 +109,19 @@ export function bindExtensionSettings(): void {
       dragRadialMenuCheckbox.checked = dragRadialMenuEnabledFromStored(
         values[DRAG_RADIAL_MENU_ENABLED_KEY],
       );
+    }
+    if (preferOriginalMediaCheckbox) {
+      preferOriginalMediaCheckbox.checked = preferOriginalMediaFromStored(
+        values[PREFER_ORIGINAL_MEDIA_KEY],
+      );
+      void readPreferOriginalMedia().then((enabled) => {
+        if (preferOriginalMediaCheckbox.isConnected) {
+          preferOriginalMediaCheckbox.checked = enabled;
+        }
+      });
+    } else {
+      // Migrate in the background even when the shared form is not mounted.
+      void readPreferOriginalMedia();
     }
     const saveTargetKind = saveTargetKindFromStored(values[SAVE_TARGET_KIND_KEY]);
     if (saveTargetFolderRadio) saveTargetFolderRadio.checked = saveTargetKind === 'folder';

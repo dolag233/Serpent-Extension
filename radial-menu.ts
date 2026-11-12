@@ -712,6 +712,7 @@ async function requestSave(
     kind: media.kind,
     sourcePageUrl: window.location.href,
     mediaUrl: media.mediaUrl,
+    selection: media.selection,
     targetFolderId: collectionMode ? null : targetFolderId,
     ...(collectionMode && targetFolderId
       ? { targetCollectionId: targetFolderId }

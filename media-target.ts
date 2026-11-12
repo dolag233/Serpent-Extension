@@ -1,6 +1,10 @@
+import { buildMediaSelection, selectionForBackgroundImage } from './media-resolution/resolve';
+import type { MediaSelection } from './media-resolution/types';
+
 export interface MediaTarget {
   kind: 'image' | 'video';
   mediaUrl: string;
+  selection: MediaSelection;
 }
 
 const MEDIA_SEARCH_ANCESTOR_LEVELS = 8;
@@ -14,38 +18,6 @@ export function isHttpUrl(value: string | undefined | null): value is string {
   } catch {
     return false;
   }
-}
-
-export function pickLargestSrcsetUrl(srcset: string): string | undefined {
-  let bestUrl: string | undefined;
-  let bestWidth = -1;
-
-  for (const candidate of srcset.split(',')) {
-    const trimmed = candidate.trim();
-    if (!trimmed) continue;
-
-    const parts = trimmed.split(/\s+/);
-    const url = parts[0];
-    const descriptor = parts[1];
-    if (!isHttpUrl(url)) continue;
-
-    let width = 0;
-    if (descriptor?.endsWith('w')) {
-      width = Number.parseInt(descriptor.slice(0, -1), 10);
-    } else if (descriptor?.endsWith('x')) {
-      width = Number.parseFloat(descriptor.slice(0, -1)) * 1000;
-    } else if (!descriptor) {
-      width = 1;
-    }
-
-    if (!Number.isFinite(width)) continue;
-    if (width >= bestWidth) {
-      bestWidth = width;
-      bestUrl = url;
-    }
-  }
-
-  return bestUrl;
 }
 
 /** Parse the first http(s) URL from a CSS `background-image` value. */
@@ -63,132 +35,46 @@ export function extractHttpUrlFromCssBackgroundImage(
   return undefined;
 }
 
-function readImageDataUrl(img: HTMLImageElement): string | undefined {
-  const dataset = img.dataset;
-  const candidates = [
-    img.currentSrc,
-    img.src,
-    img.getAttribute('data-src'),
-    img.getAttribute('data-original'),
-    img.getAttribute('data-orig-img'),
-    img.getAttribute('data-pin-media'),
-    dataset.src,
-    dataset.original,
-    dataset.origImg,
-    dataset.pinMedia,
-  ];
-
-  for (const candidate of candidates) {
-    if (isHttpUrl(candidate)) return candidate;
-  }
-
-  return undefined;
-}
-
 export function mediaUrlFromImage(img: HTMLImageElement): string | undefined {
-  if (img.srcset) {
-    const fromSrcset = pickLargestSrcsetUrl(img.srcset);
-    if (isHttpUrl(fromSrcset)) return fromSrcset;
-  }
-
-  const direct = readImageDataUrl(img);
-  if (isHttpUrl(direct)) return direct;
-  return undefined;
+  // `currentSrc` is the source the browser selected after sizes/srcset/picture
+  // evaluation. Other URLs are resolution candidates, never the preview.
+  return img.currentSrc || undefined;
 }
 
 export function mediaUrlFromVideo(video: HTMLVideoElement): string | undefined {
-  const current = video.currentSrc || video.src;
-  if (isHttpUrl(current)) return current;
-
-  for (const source of video.querySelectorAll('source')) {
-    if (source.srcset) {
-      const fromSrcset = pickLargestSrcsetUrl(source.srcset);
-      if (isHttpUrl(fromSrcset)) return fromSrcset;
-    }
-    if (isHttpUrl(source.src)) return source.src;
-  }
-
-  return undefined;
-}
-
-function isRemoteVideoUrl(url: string): boolean {
-  try {
-    return /\.(?:mp4|m4v|webm|mov|m3u8)$/i.test(new URL(url).pathname);
-  } catch {
-    return false;
-  }
-}
-
-function videoUrlScore(url: string): number {
-  let score = 0;
-  if (/\.mp4$/i.test(new URL(url).pathname)) score += 10_000;
-  else if (/\.m3u8$/i.test(new URL(url).pathname)) score += 1_000;
-  const width = /_(\d{3,4})w(?:\.|$)/i.exec(new URL(url).pathname);
-  if (width?.[1]) score += Number(width[1]);
-  return score;
-}
-
-function pushHttpUrls(text: string, into: string[]): void {
-  const normalized = text.replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
-  for (const match of normalized.matchAll(/https?:\/\/[^\s"'<>\\]+/g)) {
-    const url = match[0].replace(/[),.;]+$/, '');
-    if (isHttpUrl(url)) into.push(url);
-  }
-}
-
-/** 播放器把地址换成 blob: 之后，从已发起的请求和页面数据里找回原始视频地址。 */
-function remoteVideoUrls(doc: Document): string[] {
-  const found: string[] = [];
-  const entries = doc.defaultView?.performance?.getEntriesByType?.('resource') ?? [];
-  for (const entry of entries) {
-    if (typeof entry.name === 'string') pushHttpUrls(entry.name, found);
-  }
-  const fromNetwork = found.filter(isRemoteVideoUrl);
-  if (fromNetwork.length > 0) return fromNetwork;
-
-  for (const script of doc.scripts) {
-    pushHttpUrls(script.textContent ?? '', found);
-  }
-  const og = doc.querySelector('meta[property="og:image"]')?.getAttribute('content');
-  if (og) pushHttpUrls(og, found);
-  return found.filter(isRemoteVideoUrl);
-}
-
-function bestRemoteVideoUrl(urls: readonly string[], hint?: string): string | undefined {
-  const unique = [...new Set(urls)];
-  if (unique.length === 0) return undefined;
-  const hintId = hint ? /([a-f0-9]{32})/i.exec(hint)?.[1]?.toLowerCase() : undefined;
-  const ranked = [...unique].sort((left, right) => videoUrlScore(right) - videoUrlScore(left));
-  if (hintId) {
-    const matched = ranked.find((url) => url.toLowerCase().includes(hintId));
-    if (matched) return matched;
-  }
-  return ranked[0];
-}
-
-function fallbackVideoUrl(video: HTMLVideoElement): string | undefined {
-  const rect = video.getBoundingClientRect();
-  if (rect.width < 80 || rect.height < 80) return undefined;
-  return bestRemoteVideoUrl(remoteVideoUrls(video.ownerDocument), video.poster);
-}
-
-function fallbackImageUrl(img: HTMLImageElement): string | undefined {
-  const rect = img.getBoundingClientRect();
-  if (rect.width < 180 || rect.height < 180) return undefined;
-  const content = img.ownerDocument.querySelector('meta[property="og:image"]')?.getAttribute('content')
-    ?? img.ownerDocument.querySelector('link[rel="preload"][as="image"]')?.getAttribute('href');
-  return isHttpUrl(content) ? content : undefined;
+  // A blob currentSrc is kept as the exact selection. A MSE/DRM source cannot
+  // be recovered by scanning unrelated page requests; a site adapter may add
+  // a separately evidenced candidate to its local selection.
+  return video.currentSrc || undefined;
 }
 
 export function mediaFromElement(element: Element): MediaTarget | null {
   if (element instanceof HTMLImageElement) {
-    const mediaUrl = mediaUrlFromImage(element) ?? fallbackImageUrl(element);
-    return mediaUrl ? { kind: 'image', mediaUrl } : null;
+    const mediaUrl = mediaUrlFromImage(element);
+    if (!mediaUrl) return null;
+    const rect = element.getBoundingClientRect();
+    const selection = buildMediaSelection({
+      element,
+      kind: 'image',
+      previewUrl: mediaUrl,
+      previewWidth: element.naturalWidth || Math.round(rect.width),
+      previewHeight: element.naturalHeight || Math.round(rect.height),
+    });
+    return { kind: 'image', mediaUrl, selection };
   }
 
   if (element instanceof HTMLVideoElement) {
-    const mediaUrl = mediaUrlFromVideo(element) ?? fallbackVideoUrl(element);
-    return mediaUrl ? { kind: 'video', mediaUrl } : null;
+    const mediaUrl = mediaUrlFromVideo(element);
+    if (!mediaUrl) return null;
+    const rect = element.getBoundingClientRect();
+    const selection = buildMediaSelection({
+      element,
+      kind: 'video',
+      previewUrl: mediaUrl,
+      previewWidth: element.videoWidth || Math.round(rect.width),
+      previewHeight: element.videoHeight || Math.round(rect.height),
+    });
+    return { kind: 'video', mediaUrl, selection };
   }
 
   if (element instanceof HTMLPictureElement) {
@@ -206,7 +92,12 @@ function mediaFromBackgroundImage(element: Element): MediaTarget | null {
   const mediaUrl =
     extractHttpUrlFromCssBackgroundImage(inlineBackground)
     ?? extractHttpUrlFromCssBackgroundImage(computedBackground);
-  return mediaUrl ? { kind: 'image', mediaUrl } : null;
+  if (!mediaUrl) return null;
+  return {
+    kind: 'image',
+    mediaUrl,
+    selection: selectionForBackgroundImage(element, mediaUrl),
+  };
 }
 
 function elementContainsPoint(

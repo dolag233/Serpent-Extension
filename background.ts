@@ -18,9 +18,11 @@ import { saveMenuTitle } from './connection-ui';
 import { installHotlinkRules } from './hotlink-sites';
 import {
   readExtensionSaveBehavior,
+  readPreferOriginalMedia,
   readSaveTargetKind,
   SAVE_TARGET_KIND_KEY,
   type SaveTargetKind,
+  type ExtensionSaveBehavior,
 } from './preferences';
 import {
   deliverSaveUpload,
@@ -30,17 +32,39 @@ import {
   probeSerpentConnection,
   saveIntentFromContextMenu,
   saveMediaViaBrowser,
+  MAX_BROWSER_FETCH_BYTES,
   type ExtensionCollectionOption,
   type FetchedMedia,
+  type SaveOutcome,
+  type PageBlobFetcher,
+  type PageBridgeFetcher,
+  type SaveExecutionOptions,
   type SaveIntent,
   type UserNotification,
 } from './save-client';
+import type { MediaCandidate, MediaSelection } from './media-resolution/types';
+import { safePinterestPosterUrl } from './media-resolution/pinterest-video';
+import {
+  consumeSegmentedPreviewFallback,
+  type SegmentedFallbackFinalState,
+  type SegmentedPreviewFallbackIntent,
+  type SegmentedRecoveryOutcome,
+} from './media-resolution/segmented-preview-fallback';
+import type { PageBridgeAdapter } from './media-resolution/page-bridge-data';
+import {
+  SEGMENTED_MEDIA_RECOVERY_ALARM,
+  clearSegmentedMediaRecoveryAlarmWhenIdle,
+  hasPendingSegmentedMediaTransfers,
+  resumePendingSegmentedMediaTransfers,
+  scheduleSegmentedMediaRecoveryAlarm,
+} from './media-transfer';
 
 interface SerpentContextMenuClickData {
   menuItemId: string | number;
   mediaType?: 'image' | 'video' | 'audio';
   pageUrl?: string;
   srcUrl?: string;
+  frameId?: number;
   tab?: { id?: number };
 }
 
@@ -61,6 +85,22 @@ const ICON_SIZES = [32, 48, 64, 128] as const;
 
 let notificationSequence = 0;
 let connectionState: 'connected' | 'disconnected' = 'disconnected';
+interface BatchSaveJob {
+  readonly tabId: number;
+  readonly frameId: number;
+  readonly token: number;
+  stopRequested: boolean;
+  halted: boolean;
+  haltMessage: string;
+  commitTail: Promise<void>;
+}
+const batchSaveJobs = new Map<string, BatchSaveJob>();
+
+class BatchCommitCancelled extends Error {
+  constructor() {
+    super('batch commit cancelled');
+  }
+}
 let dynamicFolderMenuIds: string[] = [];
 let pageActionsVisible = true;
 let saveMenuVisible = true;
@@ -71,6 +111,20 @@ const CAPTURE_GAP_MS = 600;
 let nextCaptureAt = 0;
 let captureQueue: Promise<void> = Promise.resolve();
 let folderMenuRefreshPromise: Promise<void> | null = null;
+const SEGMENTED_PREVIEW_FALLBACK_KEY = 'serpent.segmentedPreviewFallbacks.v1';
+const SEGMENTED_PREVIEW_FALLBACK_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
+const MAX_SEGMENTED_PREVIEW_FALLBACK_RECORDS = 512;
+
+type SegmentedPreviewFallbackState = SegmentedFallbackFinalState | 'claimed';
+interface StoredSegmentedPreviewFallback {
+  state: SegmentedPreviewFallbackState;
+  updatedAt: number;
+  notificationsEnabled: boolean;
+  reason?: string;
+}
+
+const segmentedPreviewFallbacksInFlight = new Set<string>();
+let segmentedPreviewFallbackStorageTail: Promise<void> = Promise.resolve();
 
 async function readRecentFolderIds(): Promise<string[]> {
   const values = await browser.storage.local.get(RECENT_FOLDER_IDS_KEY);
@@ -273,20 +327,197 @@ async function captureVisibleTabPaced(windowId: number): Promise<string> {
   return scheduled;
 }
 
-function storedContextMedia(value: unknown): { kind: 'image' | 'video'; mediaUrl: string } | null {
+function storedSelection(
+  value: unknown,
+  kind: 'image' | 'video',
+  previewUrl: string,
+  frameId?: number,
+): MediaSelection | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const selectionKind = Reflect.get(value, 'kind');
+  const selectionId = Reflect.get(value, 'selectionId');
+  const documentId = Reflect.get(value, 'documentId');
+  const selectionPreview = Reflect.get(value, 'previewUrl');
+  const pageUrl = Reflect.get(value, 'pageUrl');
+  const candidatesRaw = Reflect.get(value, 'candidates');
+  if (
+    selectionKind !== kind ||
+    typeof selectionId !== 'string' ||
+    typeof documentId !== 'string' ||
+    selectionPreview !== previewUrl ||
+    typeof pageUrl !== 'string' ||
+    !Array.isArray(candidatesRaw)
+  ) return undefined;
+
+  const candidateList: MediaCandidate[] = candidatesRaw.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== 'object') return [];
+    const url = Reflect.get(candidate, 'url');
+    const candidateKind = Reflect.get(candidate, 'kind');
+    const source = Reflect.get(candidate, 'source');
+    if (
+      typeof url !== 'string' ||
+      (candidateKind !== 'image' && candidateKind !== 'video') ||
+      candidateKind !== kind ||
+      !['site-field', 'srcset', 'known-transform', 'structured-data', 'page-bridge', 'preview'].includes(String(source))
+    ) return [];
+    if (source !== 'preview') {
+      try {
+        const protocol = new URL(url).protocol;
+        if (protocol !== 'http:' && protocol !== 'https:') return [];
+      } catch {
+        return [];
+      }
+    }
+    const contentId = Reflect.get(candidate, 'contentId');
+    const mediaKey = Reflect.get(candidate, 'mediaKey');
+    const mediaIndex = Reflect.get(candidate, 'mediaIndex');
+    const width = Reflect.get(candidate, 'width');
+    const height = Reflect.get(candidate, 'height');
+    return [{
+      url,
+      kind,
+      source: source as MediaCandidate['source'],
+      ...(typeof contentId === 'string' ? { contentId } : {}),
+      ...(typeof mediaKey === 'string' && /^\d+_\d{1,32}$/.test(mediaKey) ? { mediaKey } : {}),
+      ...(typeof mediaIndex === 'number' && Number.isSafeInteger(mediaIndex) ? { mediaIndex } : {}),
+      ...(typeof width === 'number' && Number.isFinite(width) ? { width } : {}),
+      ...(typeof height === 'number' && Number.isFinite(height) ? { height } : {}),
+    }];
+  });
+  if (!candidateList.some((candidate) => candidate.source === 'preview' && candidate.url === previewUrl)) {
+    candidateList.push({ url: previewUrl, kind, source: 'preview' });
+  }
+
+  const detailPageUrl = Reflect.get(value, 'detailPageUrl');
+  const contentId = Reflect.get(value, 'contentId');
+  const mediaKey = Reflect.get(value, 'mediaKey');
+  const mediaIndex = Reflect.get(value, 'mediaIndex');
+  const previewWidth = Reflect.get(value, 'previewWidth');
+  const previewHeight = Reflect.get(value, 'previewHeight');
+  const siteAdapter = Reflect.get(value, 'siteAdapter');
+  const posterUrl = siteAdapter === 'pinterest'
+    ? safePinterestPosterUrl(Reflect.get(value, 'posterUrl'))
+    : undefined;
+  const siteCapability = Reflect.get(value, 'siteCapability');
+  const evidence = Reflect.get(value, 'evidence');
+  return {
+    selectionId,
+    documentId,
+    ...(frameId === undefined ? {} : { frameId }),
+    kind,
+    previewUrl,
+    pageUrl,
+    ...(typeof detailPageUrl === 'string' ? { detailPageUrl } : {}),
+    ...(posterUrl ? { posterUrl } : {}),
+    ...(typeof contentId === 'string' ? { contentId } : {}),
+    ...(typeof mediaKey === 'string' && /^\d+_\d{1,32}$/.test(mediaKey) ? { mediaKey } : {}),
+    ...(typeof mediaIndex === 'number' && Number.isSafeInteger(mediaIndex) ? { mediaIndex } : {}),
+    ...(typeof previewWidth === 'number' && Number.isFinite(previewWidth) ? { previewWidth } : {}),
+    ...(typeof previewHeight === 'number' && Number.isFinite(previewHeight) ? { previewHeight } : {}),
+    ...(typeof siteAdapter === 'string' ? { siteAdapter: siteAdapter as MediaSelection['siteAdapter'] } : {}),
+    ...(typeof siteCapability === 'string' ? { siteCapability: siteCapability as MediaSelection['siteCapability'] } : {}),
+    candidates: candidateList,
+    ...(evidence && typeof evidence === 'object' ? { evidence: evidence as MediaSelection['evidence'] } : {}),
+  };
+}
+
+function storedContextMedia(value: unknown, frameId?: number): {
+  kind: 'image' | 'video';
+  mediaUrl: string;
+  selection: MediaSelection;
+} | null {
   if (!value || typeof value !== 'object') return null;
   const kind = Reflect.get(value, 'kind');
   const mediaUrl = Reflect.get(value, 'mediaUrl');
   if ((kind !== 'image' && kind !== 'video') || typeof mediaUrl !== 'string' || !mediaUrl) {
     return null;
   }
-  return { kind, mediaUrl };
+  const rawSelection = Reflect.get(value, 'selection');
+  const selection = storedSelection(rawSelection, kind, mediaUrl, frameId);
+  if (!selection) return null;
+  return { kind, mediaUrl, selection };
 }
 
-async function linkClickHasMedia(tabId: number | undefined): Promise<boolean> {
+function pageBridgeAdapterForSelection(selection: MediaSelection): PageBridgeAdapter | undefined {
+  if (selection.siteCapability !== 'page-bridge') return undefined;
+  const adapter = selection.siteAdapter;
+  if (adapter === 'x' && selection.kind === 'video') return 'x-status-media';
+  return selection.kind === 'image' && (
+    adapter === 'google-images' || adapter === 'duckduckgo-images' || adapter === 'yandex-images'
+  ) ? adapter : undefined;
+}
+
+function pageBridgeFetcherForFrame(tabId: number, frameId: number): PageBridgeFetcher {
+  return async (selection) => {
+    const adapter = pageBridgeAdapterForSelection(selection);
+    if (
+      !adapter || !selection.contentId ||
+      selection.previewUrl.length > 4_096 || selection.pageUrl.length > 4_096
+    ) return [];
+    const selectedContentId = selection.contentId;
+    const response = await browser.tabs.sendMessage(tabId, {
+      type: 'serpent-page-bridge-candidates',
+      adapter,
+      contentId: selection.contentId,
+      previewUrl: selection.previewUrl,
+      pageUrl: selection.pageUrl,
+      kind: selection.kind,
+      ...(selection.mediaIndex === undefined ? {} : { mediaIndex: selection.mediaIndex }),
+      ...(selection.mediaKey ? { mediaKey: selection.mediaKey } : {}),
+    }, { frameId }).catch(() => null);
+    const rawCandidates = response && typeof response === 'object'
+      ? Reflect.get(response, 'candidates')
+      : undefined;
+    if (!Array.isArray(rawCandidates)) return [];
+    return rawCandidates.slice(0, 8).flatMap((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return [];
+      const url = Reflect.get(candidate, 'url');
+      const contentId = Reflect.get(candidate, 'contentId');
+      const kind = Reflect.get(candidate, 'kind');
+      const mediaIndex = Reflect.get(candidate, 'mediaIndex');
+      if (
+        typeof url !== 'string' || contentId !== selectedContentId || url === selection.previewUrl ||
+        kind !== selection.kind || (selection.mediaIndex !== undefined && mediaIndex !== selection.mediaIndex)
+      ) return [];
+      try {
+        const parsed = new URL(url);
+        if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || parsed.username || parsed.password) return [];
+      } catch { return []; }
+      return [{ url, contentId: selectedContentId, kind: selection.kind, ...(typeof mediaIndex === 'number' ? { mediaIndex } : {}) }];
+    });
+  };
+}
+
+async function linkClickHasMedia(tabId: number | undefined, frameUrl?: string): Promise<boolean> {
   if (tabId == null) return false;
-  const media = await browser.tabs.sendMessage(tabId, { type: 'serpent-context-media' }).catch(() => null);
+  const media = await browser.tabs.sendMessage(tabId, {
+    type: 'serpent-context-media',
+    checkOnly: true,
+    ...(frameUrl ? { pageUrl: frameUrl } : {}),
+  }).catch(() => null);
   return storedContextMedia(media) !== null;
+}
+
+async function contextMediaForEvent(info: SerpentContextMenuClickData): Promise<{
+  kind: 'image' | 'video';
+  mediaUrl: string;
+  selection: MediaSelection;
+} | null> {
+  const tabId = info.tab?.id;
+  if (tabId == null || info.frameId === undefined || typeof info.srcUrl !== 'string') return null;
+  const value = await browser.tabs.sendMessage(
+    tabId,
+    {
+      type: 'serpent-context-media',
+      srcUrl: info.srcUrl,
+      pageUrl: info.pageUrl,
+    },
+    { frameId: info.frameId },
+  ).catch(() => null);
+  const media = storedContextMedia(value, info.frameId);
+  if (!media || media.mediaUrl !== info.srcUrl) return null;
+  if (typeof info.pageUrl === 'string' && media.selection.pageUrl !== info.pageUrl) return null;
+  return media;
 }
 
 function refreshOpenContextMenu(): void {
@@ -508,11 +739,186 @@ async function bootstrapExtension(): Promise<void> {
   await installMenus();
   await installHotlinkRules();
   scheduleConnectionChecks();
+  void recoverSegmentedMediaTransfers();
 }
 
-function showNotification(notification: UserNotification): void {
-  void readExtensionSaveBehavior().then((behavior) => {
-    if (!behavior.notificationsEnabled) return;
+function isFallbackRequestId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+}
+
+function parseStoredSegmentedPreviewFallbacks(value: unknown): Record<string, StoredSegmentedPreviewFallback> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const records: Record<string, StoredSegmentedPreviewFallback> = {};
+  for (const [requestId, raw] of Object.entries(value)) {
+    if (!isFallbackRequestId(requestId) || !raw || typeof raw !== 'object') continue;
+    const state = Reflect.get(raw, 'state');
+    const updatedAt = Reflect.get(raw, 'updatedAt');
+    const notificationsEnabled = Reflect.get(raw, 'notificationsEnabled');
+    const reason = Reflect.get(raw, 'reason');
+    if (
+      !['claimed', 'saved', 'pending', 'failed', 'unknown'].includes(String(state))
+      || typeof updatedAt !== 'number' || !Number.isFinite(updatedAt)
+      || typeof notificationsEnabled !== 'boolean'
+    ) continue;
+    records[requestId] = {
+      state: state as SegmentedPreviewFallbackState,
+      updatedAt,
+      notificationsEnabled,
+      ...(typeof reason === 'string' ? { reason: reason.slice(0, 240) } : {}),
+    };
+  }
+  return records;
+}
+
+async function updateStoredSegmentedPreviewFallbacks<T>(
+  update: (records: Record<string, StoredSegmentedPreviewFallback>) => T,
+): Promise<T> {
+  const operation = segmentedPreviewFallbackStorageTail.then(async () => {
+    const stored = await browser.storage.local.get(SEGMENTED_PREVIEW_FALLBACK_KEY);
+    const records = parseStoredSegmentedPreviewFallbacks(stored[SEGMENTED_PREVIEW_FALLBACK_KEY]);
+    const result = update(records);
+    const expiration = Date.now() - SEGMENTED_PREVIEW_FALLBACK_TTL_MS;
+    for (const [requestId, record] of Object.entries(records)) {
+      if (record.updatedAt < expiration && record.state !== 'claimed') delete records[requestId];
+    }
+    const ordered = Object.entries(records).sort((left, right) => left[1].updatedAt - right[1].updatedAt);
+    for (const [requestId, record] of ordered) {
+      if (Object.keys(records).length <= MAX_SEGMENTED_PREVIEW_FALLBACK_RECORDS) break;
+      if (record.state !== 'claimed') delete records[requestId];
+    }
+    await browser.storage.local.set({ [SEGMENTED_PREVIEW_FALLBACK_KEY]: records });
+    return result;
+  });
+  segmentedPreviewFallbackStorageTail = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+async function claimSegmentedPreviewFallback(
+  requestId: string,
+  behavior: ExtensionSaveBehavior,
+): Promise<'claimed' | 'duplicate' | 'unavailable'> {
+  if (!isFallbackRequestId(requestId)) return 'unavailable';
+  if (segmentedPreviewFallbacksInFlight.has(requestId)) return 'duplicate';
+  segmentedPreviewFallbacksInFlight.add(requestId);
+  try {
+    const claimed = await updateStoredSegmentedPreviewFallbacks((records) => {
+      if (Object.hasOwn(records, requestId)) return false;
+      records[requestId] = {
+        state: 'claimed',
+        updatedAt: Date.now(),
+        notificationsEnabled: behavior.notificationsEnabled,
+      };
+      return true;
+    });
+    if (claimed) return 'claimed';
+    segmentedPreviewFallbacksInFlight.delete(requestId);
+    return 'duplicate';
+  } catch {
+    segmentedPreviewFallbacksInFlight.delete(requestId);
+    return 'unavailable';
+  }
+}
+
+async function finishSegmentedPreviewFallback(
+  requestId: string,
+  state: SegmentedFallbackFinalState,
+  reason: string | undefined,
+  behavior: ExtensionSaveBehavior,
+): Promise<void> {
+  try {
+    await updateStoredSegmentedPreviewFallbacks((records) => {
+      if (!Object.hasOwn(records, requestId)) return;
+      records[requestId] = {
+        state,
+        updatedAt: Date.now(),
+        notificationsEnabled: behavior.notificationsEnabled,
+        ...(reason ? { reason: reason.slice(0, 240) } : {}),
+      };
+    });
+  } finally {
+    segmentedPreviewFallbacksInFlight.delete(requestId);
+  }
+}
+
+async function settleAbandonedSegmentedPreviewFallbacks(): Promise<void> {
+  const abandoned = await updateStoredSegmentedPreviewFallbacks((records) => {
+    const pending: Array<{ notificationsEnabled: boolean }> = [];
+    for (const [requestId, record] of Object.entries(records)) {
+      if (record.state !== 'claimed' || segmentedPreviewFallbacksInFlight.has(requestId)) continue;
+      record.state = 'unknown';
+      record.updatedAt = Date.now();
+      record.reason = '预览回退任务中断，结果未确认；为避免重复导入，扩展不会自动重试。';
+      pending.push({ notificationsEnabled: record.notificationsEnabled });
+    }
+    return pending;
+  });
+  for (const record of abandoned) {
+    showNotification({
+      title: '预览回退结果未确认',
+      message: '预览回退任务中断，扩展不会自动重试。请检查 Serpent 资源库后再决定是否手动保存。',
+    }, record.notificationsEnabled);
+  }
+}
+
+async function consumeSegmentedRecoveryOutcome(
+  outcome: SegmentedRecoveryOutcome,
+  handledSourceFailures: Set<string>,
+): Promise<void> {
+  if (outcome.state !== 'source-failed' || !outcome.fallbackIntent) return;
+  handledSourceFailures.add(outcome.requestId);
+  const fallbackIntent: SegmentedPreviewFallbackIntent = outcome.fallbackIntent;
+  const consumed = await consumeSegmentedPreviewFallback(outcome, {
+    claim: claimSegmentedPreviewFallback,
+    save: (intent, behavior) => saveMediaViaBrowser(intent, behavior),
+    finish: finishSegmentedPreviewFallback,
+  });
+  if (consumed.kind === 'handled') {
+    const notification = consumed.state === 'unknown'
+      ? {
+          title: '预览回退结果未确认',
+          message: consumed.reason || '为避免重复导入，扩展不会自动重试。请检查 Serpent 资源库。',
+        }
+      : consumed.outcome
+        ? notificationForOutcome(consumed.outcome)
+        : { title: '预览回退失败', message: consumed.reason || '无法保存当前预览。' };
+    showNotification(notification, consumed.intent.behavior.notificationsEnabled);
+  } else if (consumed.kind === 'ineligible') {
+    showNotification({ title: '视频恢复失败', message: consumed.reason }, fallbackIntent.behavior.notificationsEnabled);
+  }
+}
+
+async function recoverSegmentedMediaTransfers(): Promise<void> {
+  try {
+    await settleAbandonedSegmentedPreviewFallbacks();
+    if (!(await hasPendingSegmentedMediaTransfers())) {
+      await clearSegmentedMediaRecoveryAlarmWhenIdle();
+      return;
+    }
+    await scheduleSegmentedMediaRecoveryAlarm();
+    const handledSourceFailures = new Set<string>();
+    const outcomes = await resumePendingSegmentedMediaTransfers({
+      onOutcome: (outcome) => consumeSegmentedRecoveryOutcome(outcome, handledSourceFailures),
+    });
+    for (const outcome of outcomes) {
+      if (handledSourceFailures.has(outcome.requestId)) continue;
+      showNotification(outcome.state === 'saved'
+        ? outcome.duplicate
+          ? notificationForOutcome({ kind: 'accepted', duplicate: true })
+          : { title: '已恢复视频保存', message: '分段传输已完成并导入资源库。' }
+        : { title: '视频恢复失败', message: outcome.reason || '分段传输无法恢复。' });
+    }
+  } catch {
+    // Preserve the journal and let the periodic alarm retry after transient worker/network errors.
+    await scheduleSegmentedMediaRecoveryAlarm().catch(() => {});
+  }
+}
+
+function showNotification(notification: UserNotification, notificationsEnabledSnapshot?: boolean): void {
+  const enabled = notificationsEnabledSnapshot === undefined
+    ? readExtensionSaveBehavior().then((behavior) => behavior.notificationsEnabled)
+    : Promise.resolve(notificationsEnabledSnapshot);
+  void enabled.then((notificationsEnabled) => {
+    if (!notificationsEnabled) return;
     notificationSequence += 1;
     void browser.notifications.create(
       `serpent-save-${Date.now()}-${notificationSequence}`,
@@ -539,13 +945,24 @@ async function rememberRecentFolder(
 
 async function resolveSaveIntent(
   intent: SaveIntent,
+  snapshot?: { targetKind?: SaveTargetKind; preferOriginalMedia?: boolean },
 ): Promise<SaveIntent | UserNotification> {
-  const kind = await readSaveTargetKind();
+  const [kind, preferOriginalMedia] = await Promise.all([
+    snapshot?.targetKind ? Promise.resolve(snapshot.targetKind) : readSaveTargetKind(),
+    snapshot?.preferOriginalMedia === undefined
+      ? readPreferOriginalMedia()
+      : Promise.resolve(snapshot.preferOriginalMedia),
+  ]);
+  const base = {
+    kind: intent.kind,
+    sourcePageUrl: intent.sourcePageUrl,
+    mediaUrl: intent.mediaUrl,
+    preferOriginalMedia,
+    ...(intent.selection ? { selection: intent.selection } : {}),
+  };
   if (kind === 'folder') {
     return {
-      kind: intent.kind,
-      sourcePageUrl: intent.sourcePageUrl,
-      mediaUrl: intent.mediaUrl,
+      ...base,
       ...(intent.targetFolderId !== undefined
         ? { targetFolderId: intent.targetFolderId }
         : {}),
@@ -565,30 +982,164 @@ async function resolveSaveIntent(
     };
   }
   return {
-    kind: intent.kind,
-    sourcePageUrl: intent.sourcePageUrl,
-    mediaUrl: intent.mediaUrl,
+    ...base,
     targetFolderId: null,
     targetCollectionId: collectionId,
   };
 }
 
+interface PageBlobPort {
+  postMessage(message: unknown): void;
+  disconnect(): void;
+  onMessage: { addListener(callback: (message: unknown) => void): void };
+  onDisconnect: { addListener(callback: () => void): void };
+}
+
+function readPageBlobInFrame(
+  tabId: number,
+  frameId: number,
+  mediaUrl: string,
+  intent: SaveIntent,
+): Promise<{ body: ArrayBuffer; contentType: string } | { error: string }> {
+  const selection = intent.selection;
+  if (
+    !selection || selection.previewUrl !== mediaUrl || selection.pageUrl !== intent.sourcePageUrl ||
+    !mediaUrl.startsWith('blob:') || selection.frameId !== frameId
+  ) return Promise.resolve({ error: 'page blob context does not match the selected frame' });
+
+  let port: PageBlobPort;
+  try {
+    port = browser.tabs.connect(tabId, {
+      name: 'serpent-page-blob-read',
+      frameId,
+    }) as unknown as PageBlobPort;
+  } catch {
+    return Promise.resolve({ error: 'selected page frame is unavailable' });
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let output: Uint8Array | undefined;
+    let contentType = 'application/octet-stream';
+    let expectedSeq = 0;
+    let offset = 0;
+    const finish = (result: { body: ArrayBuffer; contentType: string } | { error: string }) => {
+      if (settled) return;
+      settled = true;
+      try { port.disconnect(); } catch { /* The source frame may already have closed. */ }
+      resolve(result);
+    };
+    port.onMessage.addListener((message) => {
+      if (!message || typeof message !== 'object') return;
+      const type = Reflect.get(message, 'type');
+      if (type === 'serpent-page-blob-error') {
+        const reason = Reflect.get(message, 'reason');
+        finish({ error: typeof reason === 'string' ? reason.slice(0, 200) : 'page blob read failed' });
+        return;
+      }
+      if (type === 'serpent-page-blob-meta') {
+        const size = Reflect.get(message, 'size');
+        const mime = Reflect.get(message, 'contentType');
+        if (
+          output || typeof size !== 'number' || !Number.isSafeInteger(size) ||
+          size <= 0 || size > MAX_BROWSER_FETCH_BYTES
+        ) {
+          finish({ error: 'page blob size is invalid or exceeds 500 MiB' });
+          return;
+        }
+        output = new Uint8Array(size);
+        if (typeof mime === 'string' && mime.length <= 200) contentType = mime;
+        return;
+      }
+      if (type === 'serpent-page-blob-chunk') {
+        const seq = Reflect.get(message, 'seq');
+        const size = Reflect.get(message, 'size');
+        const data = Reflect.get(message, 'data');
+        if (
+          !output || seq !== expectedSeq || typeof seq !== 'number' ||
+          typeof size !== 'number' || !Number.isSafeInteger(size) ||
+          size <= 0 || size > 64 * 1024 || typeof data !== 'string' ||
+          data.length > 90_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)
+        ) {
+          finish({ error: 'page blob chunk is invalid' });
+          return;
+        }
+        let decoded: string;
+        try {
+          decoded = atob(data);
+        } catch {
+          finish({ error: 'page blob chunk encoding is invalid' });
+          return;
+        }
+        if (decoded.length !== size || offset + size > output.length) {
+          finish({ error: 'page blob chunk length is invalid' });
+          return;
+        }
+        for (let index = 0; index < size; index += 1) output[offset + index] = decoded.charCodeAt(index);
+        offset += size;
+        expectedSeq += 1;
+        port.postMessage({ type: 'serpent-page-blob-ack', seq });
+        return;
+      }
+      if (type === 'serpent-page-blob-done') {
+        const chunks = Reflect.get(message, 'chunks');
+        const size = Reflect.get(message, 'size');
+        if (!output || chunks !== expectedSeq || size !== offset || offset !== output.length) {
+          finish({ error: 'page blob transfer ended before all bytes arrived' });
+          return;
+        }
+        finish({ body: output.buffer as ArrayBuffer, contentType });
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      finish({ error: 'selected page frame disconnected during blob read' });
+    });
+    port.postMessage({
+      type: 'serpent-page-blob-read',
+      url: mediaUrl,
+      pageUrl: selection.pageUrl,
+    });
+  });
+}
+
 async function saveIntentAndNotify(
   intent: SaveIntent,
-  options?: { quiet?: boolean; settle?: boolean },
+  options?: {
+    quiet?: boolean;
+    settle?: boolean;
+    targetKind?: SaveTargetKind;
+    preferOriginalMedia?: boolean;
+    behaviorSnapshot?: ExtensionSaveBehavior;
+  },
+  pageContext?: { tabId?: number; frameId?: number },
+  outcomeSink?: { value: SaveOutcome | null },
+  execution?: SaveExecutionOptions,
 ): Promise<UserNotification> {
-  const resolved = await resolveSaveIntent(intent);
+  if (outcomeSink) outcomeSink.value = null;
+  const resolved = await resolveSaveIntent(intent, options);
   if ('title' in resolved) {
     if (!options?.quiet) showNotification(resolved);
     return resolved;
   }
 
-  const behavior = await readExtensionSaveBehavior();
+  const behavior = options?.behaviorSnapshot ?? await readExtensionSaveBehavior();
   const keepDesktopFollowup = !options?.quiet || options.settle === true;
   const effective = keepDesktopFollowup
     ? behavior
     : { ...behavior, focusAppAfterSave: false, revealInLibraryAfterSave: false };
-  const outcome = await saveMediaViaBrowser(resolved, effective);
+  const blobTabId = pageContext?.tabId;
+  const blobFrameId = pageContext?.frameId;
+  const pageBlobFetcher: PageBlobFetcher | undefined =
+    blobTabId !== undefined && blobFrameId !== undefined
+      ? (mediaUrl, blobIntent) => readPageBlobInFrame(blobTabId, blobFrameId, mediaUrl, blobIntent)
+      : undefined;
+  const pageBridgeFetcher = blobTabId !== undefined && blobFrameId !== undefined
+    ? pageBridgeFetcherForFrame(blobTabId, blobFrameId)
+    : undefined;
+  const outcome = await saveMediaViaBrowser(
+    resolved, effective, fetch, pageBlobFetcher, pageBridgeFetcher, undefined, execution,
+  );
+  if (outcomeSink) outcomeSink.value = outcome;
   if (outcome.kind === 'accepted' && keepDesktopFollowup) {
     if (resolved.targetCollectionId) {
       const collectionsOutcome = await fetchSerpentCollections();
@@ -690,74 +1241,294 @@ async function savePngDataUrl(
 async function saveBatch(
   message: object,
   tabId: number | undefined,
-): Promise<{ saved: number; failed: number; message: string }> {
+  frameId?: number,
+): Promise<{ saved: number; duplicate: number; failed: number; pending: number; skipped: number; stopped?: boolean; message: string }> {
   if (connectionState !== 'connected') {
     const notification = {
       title: '无法保存到 Serpent',
       message: '请先启动 Serpent 桌面应用并打开资源库。',
     };
     showNotification(notification);
-    return { saved: 0, failed: 0, message: notification.message };
+    return { saved: 0, duplicate: 0, failed: 0, pending: 0, skipped: 0, message: notification.message };
   }
   const sourcePageUrl = Reflect.get(message, 'sourcePageUrl');
   const items = Reflect.get(message, 'items');
   const targetFolderId = Reflect.get(message, 'targetFolderId');
   const targetCollectionId = Reflect.get(message, 'targetCollectionId');
   if (typeof sourcePageUrl !== 'string' || !Array.isArray(items)) {
-    return { saved: 0, failed: 0, message: '保存请求无效' };
+    return { saved: 0, duplicate: 0, failed: 0, pending: 0, skipped: 0, message: '保存请求无效' };
   }
-  const queue = items.slice(0, 200);
   const token = Reflect.get(message, 'token');
-  const report = (done: number, total: number) => {
-    if (tabId == null || typeof token !== 'number') return;
-    void browser.tabs.sendMessage(tabId, {
-      type: 'serpent-batch-progress',
-      token,
-      done,
-      total,
-    }).catch(() => {});
-  };
-  let saved = 0;
-  let failed = 0;
-  let failure = '';
-  report(0, queue.length);
-  for (let index = 0; index < queue.length; index += 1) {
-    const item = queue[index];
-    if (!item || typeof item !== 'object') {
-      failed += 1;
-      continue;
-    }
-    const kind = Reflect.get(item, 'kind');
-    const mediaUrl = Reflect.get(item, 'mediaUrl');
-    if ((kind !== 'image' && kind !== 'video') || typeof mediaUrl !== 'string') {
-      failed += 1;
-      continue;
-    }
-    const notification = await saveIntentAndNotify({
-      kind,
-      sourcePageUrl,
-      mediaUrl,
-      ...(targetFolderId === null || typeof targetFolderId === 'string'
-        ? { targetFolderId }
-        : {}),
-      ...(typeof targetCollectionId === 'string' && targetCollectionId
-        ? { targetCollectionId }
-        : {}),
-    }, { quiet: true, settle: index === queue.length - 1 });
-    if (notification.title === '已发送到 Serpent') saved += 1;
-    else {
-      failed += 1;
-      failure = notification.message;
-      report(index + 1, queue.length);
-      break;
-    }
-    report(index + 1, queue.length);
+  if (
+    tabId == null || !Number.isSafeInteger(tabId) ||
+    frameId == null || !Number.isSafeInteger(frameId) || frameId < 0 ||
+    typeof token !== 'number' || !Number.isSafeInteger(token) || token < 0
+  ) return { saved: 0, duplicate: 0, failed: 0, pending: 0, skipped: 0, message: '批量保存身份无效' };
+  const jobKey = `${tabId}:${frameId}:${token}`;
+  if (batchSaveJobs.has(jobKey)) {
+    return { saved: 0, duplicate: 0, failed: 0, pending: 0, skipped: 0, message: '这个批量任务已经在运行' };
   }
-  const summary = failed === 0
-    ? `已发送 ${saved} 个文件`
-    : `已发送 ${saved} 个，失败 ${failed} 个。${failure}`;
-  showNotification({ title: '批量收藏', message: summary });
-  return { saved, failed, message: summary };
+  const job: BatchSaveJob = {
+    tabId,
+    frameId,
+    token,
+    stopRequested: false,
+    halted: false,
+    haltMessage: '',
+    commitTail: Promise.resolve(),
+  };
+  batchSaveJobs.set(jobKey, job);
+
+  try {
+    const queue = items.slice(0, 200);
+    const report = (done: number, total: number) => {
+      void browser.tabs.sendMessage(tabId, {
+        type: 'serpent-batch-progress',
+        token,
+        done,
+        total,
+      }, { frameId }).catch(() => {});
+    };
+    let targetKindSnapshot: SaveTargetKind;
+    let preferOriginalMediaSnapshot: boolean;
+    let behaviorSnapshot: ExtensionSaveBehavior;
+    try {
+      [targetKindSnapshot, preferOriginalMediaSnapshot, behaviorSnapshot] = await Promise.all([
+        readSaveTargetKind(),
+        readPreferOriginalMedia(),
+        readExtensionSaveBehavior(),
+      ]);
+    } catch (error) {
+      const failed = queue.length > 0 ? 1 : 0;
+      const skipped = Math.max(0, queue.length - failed);
+      const reason = error instanceof Error ? error.message : String(error);
+      const summary = `无法读取批量保存设置：${reason}`;
+      showNotification({ title: '批量收藏', message: summary });
+      return { saved: 0, duplicate: 0, failed, pending: 0, skipped, message: summary };
+    }
+    let saved = 0;
+    let duplicate = 0;
+    let savedOriginalOrHigher = 0;
+    let savedPreview = 0;
+    let failed = 0;
+    let pending = 0;
+    let skipped = 0;
+    let settled = 0;
+    let nextIndex = 0;
+    let failureMessage = '';
+    const itemSettlements = queue.map(() => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      return { promise, resolve, completed: false };
+    });
+    const finishItem = (index: number) => {
+      const settlement = itemSettlements[index];
+      if (!settlement || settlement.completed) return;
+      settlement.completed = true;
+      settlement.resolve();
+    };
+    report(0, queue.length);
+
+    const settleProgress = () => {
+      settled += 1;
+      report(settled, queue.length);
+    };
+    const fatalOutcome = (outcome: SaveOutcome, kind: 'image' | 'video'): boolean => {
+      if (outcome.kind === 'rejected' && kind === 'video' && outcome.failureKind === 'source-invalid') {
+        return false;
+      }
+      return outcome.kind === 'unreachable' || outcome.kind === 'rejected'
+        || outcome.kind === 'pending' || outcome.kind === 'transfer_failed';
+    };
+    const commit = async <T>(index: number, kind: 'image' | 'video', operation: () => Promise<T>): Promise<T> => {
+      for (let earlier = 0; earlier < index; earlier += 1) {
+        await itemSettlements[earlier]!.promise;
+      }
+      const previous = job.commitTail;
+      let release!: () => void;
+      job.commitTail = new Promise<void>((resolve) => { release = resolve; });
+      await previous;
+      try {
+        if (job.halted) throw new BatchCommitCancelled();
+        const result = await operation();
+        const resultObject = result && typeof result === 'object' ? result : null;
+        const nested = resultObject ? Reflect.get(resultObject, 'outcome') : undefined;
+        const outcome = nested && typeof nested === 'object'
+          ? nested as unknown as SaveOutcome
+          : resultObject && typeof Reflect.get(resultObject, 'kind') === 'string'
+            ? resultObject as unknown as SaveOutcome
+            : null;
+        if (outcome && fatalOutcome(outcome, kind)) {
+          job.halted = true;
+          job.haltMessage = notificationForOutcome(outcome).message;
+        }
+        return result;
+      } catch (error) {
+        if (!(error instanceof BatchCommitCancelled)) {
+          job.halted = true;
+          job.haltMessage ||= error instanceof Error ? error.message : String(error);
+        }
+        throw error;
+      } finally {
+        release();
+      }
+    };
+
+    const processItem = async (index: number): Promise<void> => {
+      try {
+      const item = queue[index];
+      if (!item || typeof item !== 'object') {
+        failed += 1;
+        settleProgress();
+        return;
+      }
+      const kind = Reflect.get(item, 'kind');
+      const mediaUrl = Reflect.get(item, 'mediaUrl');
+      if ((kind !== 'image' && kind !== 'video') || typeof mediaUrl !== 'string') {
+        failed += 1;
+        settleProgress();
+        return;
+      }
+      const selection = storedSelection(Reflect.get(item, 'selection'), kind, mediaUrl, frameId);
+      const itemSourcePageUrl = selection?.pageUrl ?? sourcePageUrl;
+      const outcomeSink: { value: SaveOutcome | null } = { value: null };
+      let countAsSettled = true;
+      try {
+        const notification = await saveIntentAndNotify({
+          kind,
+          sourcePageUrl: itemSourcePageUrl,
+          mediaUrl,
+          ...(selection ? { selection } : {}),
+          ...(targetFolderId === null || typeof targetFolderId === 'string'
+            ? { targetFolderId }
+            : {}),
+          ...(typeof targetCollectionId === 'string' && targetCollectionId
+            ? { targetCollectionId }
+            : {}),
+        }, {
+          quiet: true,
+          settle: index === queue.length - 1,
+          targetKind: targetKindSnapshot,
+          preferOriginalMedia: preferOriginalMediaSnapshot,
+          behaviorSnapshot,
+        }, { tabId, frameId }, outcomeSink, {
+          commit: (operation) => commit(index, kind, operation),
+        });
+        const outcome = outcomeSink.value;
+        if (!outcome) {
+          failed += 1;
+          job.halted = true;
+          job.haltMessage = notification.message;
+          settleProgress();
+          return;
+        }
+        if (outcome.kind === 'accepted') {
+          if (outcome.duplicate) {
+            duplicate += 1;
+          } else {
+            saved += 1;
+            if (outcome.savedVersion === 'preview') savedPreview += 1;
+            else savedOriginalOrHigher += 1;
+          }
+        } else if (outcome.kind === 'pending') {
+          pending += 1;
+        } else {
+          failed += 1;
+          failureMessage ||= notification.message;
+          if (fatalOutcome(outcome, kind)) job.halted = true;
+          if (outcome.kind !== 'fetch_failed') {
+            job.haltMessage ||= notification.message;
+          }
+        }
+      } catch (error) {
+        if (error instanceof BatchCommitCancelled) {
+          skipped += 1;
+          countAsSettled = false;
+        } else if (outcomeSink.value?.kind === 'accepted') {
+          if (outcomeSink.value.duplicate) {
+            duplicate += 1;
+          } else {
+            saved += 1;
+            if (outcomeSink.value.savedVersion === 'preview') savedPreview += 1;
+            else savedOriginalOrHigher += 1;
+          }
+        } else {
+          failed += 1;
+          failureMessage ||= error instanceof Error ? error.message : String(error);
+          job.halted = true;
+          job.haltMessage ||= error instanceof Error ? error.message : String(error);
+        }
+      }
+      if (countAsSettled) settleProgress();
+      } finally {
+        finishItem(index);
+      }
+    };
+
+    const worker = async (): Promise<void> => {
+      while (!job.stopRequested && !job.halted) {
+        const index = nextIndex;
+        if (index >= queue.length) return;
+        nextIndex += 1;
+        await processItem(index);
+      }
+    };
+
+    const configuredCollectionId = typeof targetCollectionId === 'string' && targetCollectionId
+      ? targetCollectionId
+      : typeof targetFolderId === 'string' && targetFolderId
+        ? targetFolderId
+        : undefined;
+    if (targetKindSnapshot === 'collection' && !configuredCollectionId && queue.length > 0) {
+      failed = 1;
+      job.halted = true;
+      job.haltMessage = '当前为保存到合集，请选择一个合集。';
+      settleProgress();
+      skipped += queue.length - 1;
+    } else {
+      await Promise.all(Array.from({ length: Math.min(3, queue.length) }, () => worker()));
+      if (nextIndex < queue.length) {
+        const remaining = queue.length - nextIndex;
+        skipped += remaining;
+      }
+    }
+
+    const stopped = job.stopRequested && !job.halted && skipped > 0;
+    const savedSummary = savedPreview > 0
+      ? `保存 ${savedOriginalOrHigher} 个原图或较高质量版本、${savedPreview} 个当前预览`
+      : `已保存 ${saved} 个文件`;
+    const summaryParts = [stopped
+      ? `已停止：${savedSummary}，已开始的任务已完成`
+      : savedSummary];
+    if (pending > 0) summaryParts.push(`${pending} 个视频等待后台恢复`);
+    if (duplicate > 0) summaryParts.push(`已跳过重复 ${duplicate} 个`);
+    const failureDetail = job.haltMessage || failureMessage;
+    if (failed > 0) summaryParts.push(`失败 ${failed} 个${failureDetail ? `。${failureDetail}` : ''}`);
+    if (skipped > 0) summaryParts.push(`未执行 ${skipped} 个`);
+    const summary = summaryParts.join('，');
+    showNotification({ title: '批量收藏', message: summary });
+    return { saved, duplicate, failed, pending, skipped, ...(stopped ? { stopped: true } : {}), message: summary };
+  } finally {
+    if (batchSaveJobs.get(jobKey) === job) batchSaveJobs.delete(jobKey);
+  }
+}
+
+function requestBatchStop(
+  message: object,
+  tabId: number | undefined,
+  frameId?: number,
+): { stopping: boolean; alreadyRequested?: boolean } {
+  const token = Reflect.get(message, 'token');
+  if (
+    tabId == null || !Number.isSafeInteger(tabId) ||
+    frameId == null || !Number.isSafeInteger(frameId) || frameId < 0 ||
+    typeof token !== 'number' || !Number.isSafeInteger(token) || token < 0
+  ) return { stopping: false };
+  const job = batchSaveJobs.get(`${tabId}:${frameId}:${token}`);
+  if (!job) return { stopping: false };
+  const alreadyRequested = job.stopRequested;
+  job.stopRequested = true;
+  return { stopping: true, alreadyRequested };
 }
 
 /** 把保存进度/结果气泡发送到当前标签页（无 content script 时静默忽略）。 */
@@ -766,11 +1537,13 @@ function notifySaveFeedback(
   payload:
     | { state: 'saving' }
     | { state: 'done'; title: string; message: string },
+  frameId?: number,
 ): void {
   if (!tab?.id) return;
   void browser.tabs.sendMessage(
     tab.id,
     { type: 'serpent-save-feedback', ...payload },
+    frameId === undefined ? undefined : { frameId },
   ).catch(() => {});
 }
 
@@ -782,7 +1555,9 @@ async function handleContextMenuClick(
     const tabId = info.tab?.id;
     if (tabId == null) return;
     try {
-      await browser.tabs.sendMessage(tabId, pageMessage);
+      await browser.tabs.sendMessage(tabId, pageMessage, {
+        frameId: info.frameId ?? 0,
+      });
     } catch {
       showNotification({
         title: '无法在此页面使用',
@@ -801,27 +1576,28 @@ async function handleContextMenuClick(
       state: 'done',
       title: '无法保存到 Serpent',
       message: '请先启动 Serpent 桌面应用并打开资源库。',
-    });
+    }, info.frameId);
     return;
   }
 
   const targetFolderId = parseFolderMenuId(info.menuItemId);
   if (targetFolderId === undefined) return;
 
+  const contextual = await contextMediaForEvent(info);
   let intent = saveIntentFromContextMenu({
     mediaType: info.mediaType,
     pageUrl: info.pageUrl,
     srcUrl: info.srcUrl,
+    selection: contextual?.selection,
   });
-  if (!intent && info.tab?.id != null && typeof info.pageUrl === 'string') {
-    const media = storedContextMedia(
-      await browser.tabs.sendMessage(info.tab.id, { type: 'serpent-context-media' }).catch(() => null),
-    );
+  if (!intent && contextual) {
+    const media = contextual;
     if (media) {
       intent = {
         kind: media.kind,
-        sourcePageUrl: info.pageUrl,
+        sourcePageUrl: media.selection.pageUrl,
         mediaUrl: media.mediaUrl,
+        selection: media.selection,
       };
     }
   }
@@ -834,20 +1610,20 @@ async function handleContextMenuClick(
       state: 'done',
       title: '无法保存到 Serpent',
       message: '这个媒体或页面不是可下载的 HTTP(S) 地址。',
-    });
+    }, info.frameId);
     return;
   }
 
-  notifySaveFeedback(info.tab, { state: 'saving' });
+  notifySaveFeedback(info.tab, { state: 'saving' }, info.frameId);
   const notification = await saveIntentAndNotify({
     ...intent,
     targetFolderId,
-  });
+  }, undefined, { tabId: info.tab?.id, frameId: info.frameId });
   notifySaveFeedback(info.tab, {
     state: 'done',
     title: notification.title,
     message: notification.message,
-  });
+  }, info.frameId);
 }
 
 browser.runtime.onInstalled.addListener(() => {
@@ -859,8 +1635,11 @@ browser.runtime.onStartup.addListener(() => {
 });
 
 browser.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== CONNECTION_ALARM) return;
-  void refreshConnectionState();
+  if (alarm.name === CONNECTION_ALARM) {
+    void refreshConnectionState();
+  } else if (alarm.name === SEGMENTED_MEDIA_RECOVERY_ALARM) {
+    void recoverSegmentedMediaTransfers();
+  }
 });
 
 browser.storage.onChanged.addListener((changes, areaName) => {
@@ -873,7 +1652,7 @@ browser.storage.onChanged.addListener((changes, areaName) => {
 // browser.onMessage supports the same contract).
 browser.runtime.onMessage.addListener(async (
   message: unknown,
-  sender: { tab?: { id?: number } },
+  sender: { tab?: { id?: number }; frameId?: number },
 ) => {
   if (!message || typeof message !== 'object') return undefined;
 
@@ -948,10 +1727,18 @@ browser.runtime.onMessage.addListener(async (
       };
     }
 
+    const selection = storedSelection(
+      Reflect.get(intentValue, 'selection'),
+      kind,
+      mediaUrl,
+      sender.frameId,
+    );
+
     const saveIntent: SaveIntent = {
       kind,
       sourcePageUrl,
       mediaUrl,
+      ...(selection ? { selection } : {}),
       targetFolderId:
         targetFolderId === null || typeof targetFolderId === 'string'
           ? targetFolderId
@@ -960,12 +1747,19 @@ browser.runtime.onMessage.addListener(async (
         ? { targetCollectionId }
         : {}),
     };
-    const notification = await saveIntentAndNotify(saveIntent);
+    const notification = await saveIntentAndNotify(saveIntent, undefined, {
+      tabId: sender.tab?.id,
+      frameId: sender.frameId,
+    });
     return { notification };
   }
 
   if (type === 'serpent-save-batch') {
-    return saveBatch(message, sender.tab?.id);
+    return saveBatch(message, sender.tab?.id, sender.frameId);
+  }
+
+  if (type === 'serpent-stop-batch') {
+    return requestBatchStop(message, sender.tab?.id, sender.frameId);
   }
 
   if (type === 'serpent-capture-viewport') {
@@ -1009,7 +1803,7 @@ browser.commands.onCommand.addListener((command) => {
     const tabId = tabs[0]?.id;
     if (tabId == null) return;
     if (command === 'batch-save') {
-      await browser.tabs.sendMessage(tabId, { type: 'serpent-open-batch' }).catch(() => {});
+      await browser.tabs.sendMessage(tabId, { type: 'serpent-open-batch' }, { frameId: 0 }).catch(() => {});
       return;
     }
     const mode = command === 'capture-area'
@@ -1022,7 +1816,7 @@ browser.commands.onCommand.addListener((command) => {
             ? 'element'
             : null;
     if (!mode) return;
-    await browser.tabs.sendMessage(tabId, { type: 'serpent-start-capture', mode }).catch(() => {});
+    await browser.tabs.sendMessage(tabId, { type: 'serpent-start-capture', mode }, { frameId: 0 }).catch(() => {});
   })();
 });
 
@@ -1035,7 +1829,7 @@ if (browser.contextMenus.onShown) {
       let showSave = onNativeMedia;
       let saveVisibilityKnown = onNativeMedia;
       if (!onNativeMedia && contexts.includes('link')) {
-        showSave = await linkClickHasMedia(tab?.id);
+        showSave = await linkClickHasMedia(tab?.id, info.frameUrl);
         saveVisibilityKnown = true;
       }
       const updates: Promise<void>[] = [];
@@ -1065,6 +1859,7 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
     mediaType,
     pageUrl: info.pageUrl,
     srcUrl: info.srcUrl,
+    frameId: info.frameId,
     // contextMenus 的 tab 是回调第二参数（OnClickData 本身没有 tab）；
     // 之前手写类型把它放在 info 上导致保存反馈气泡收不到 tab。
     tab: tab ? { id: tab.id } : undefined,
