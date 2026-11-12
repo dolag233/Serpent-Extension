@@ -1,6 +1,6 @@
 {
   "name": "serpent-extension",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Serpent browser extension (Chromium + Firefox): save web images/videos to the Serpent desktop app.",
   "license": "MIT",
